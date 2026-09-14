@@ -1,0 +1,100 @@
+#!/bin/sh
+# ============================================================
+# gdiptv-sniff — 抓取机顶盒的 IPTV 鉴权包，自动写入配置
+#
+# 原理（参考恩山 8413871 帖 / mozz.ie）：
+#   机顶盒开机时会向 EDS/EPG 服务器 POST
+#   /EPG/jsp/ValidAuthenticationHWCTC.jsp，表单里带
+#   UserID / NetUserID / Authenticator / userToken 等，
+#   把这串原样重放即可自助鉴权。
+#
+# 用法：
+#   1) 把电信机顶盒接到本机 LAN 口（或让它连本机 WiFi）
+#   2) gdiptv-sniff            默认抓 br-lan，180 秒
+#      gdiptv-sniff lan3 300   指定接口和时长
+#   3) 脚本提示"开始抓包"后，立刻重启机顶盒
+#   4) 抓到后自动写入 gdiptv.main.auth_body
+#
+# 若自动提取失败，把生成的 /tmp/iptv-*.pcap 拷到电脑用 Wireshark 打开，
+# 过滤 http，找 ValidAuthenticationHWCTC.jsp，
+# 右键 "HTML Form URL Encoded" -> 复制 -> As UTF-8 Text，
+# 然后手动：uci set gdiptv.main.auth_body='粘进来'; uci commit gdiptv
+# ============================================================
+
+set -u
+
+IFACE=${1:-br-lan}
+SECS=${2:-180}
+STAMP=$(date +%Y%m%d-%H%M%S)
+PCAP="/tmp/iptv-$STAMP.pcap"
+
+command -v tcpdump >/dev/null 2>&1 || { echo "缺少 tcpdump"; exit 1; }
+
+echo "============================================"
+echo " 接口 : $IFACE"
+echo " 时长 : ${SECS}s"
+echo " 输出 : $PCAP"
+echo "--------------------------------------------"
+echo " >>> 现在请重启（断电再上电）电信机顶盒 <<<"
+echo "============================================"
+
+tcpdump -i "$IFACE" -s 0 -w "$PCAP" \
+	"tcp port 8082 or tcp port 8080 or tcp port 80" >/dev/null 2>&1 &
+PID=$!
+
+# 倒计时
+i=0
+while [ $i -lt "$SECS" ]; do
+	sleep 5
+	i=$((i + 5))
+	printf "\r  已抓 %ss / %ss   " "$i" "$SECS"
+done
+echo ""
+kill "$PID" 2>/dev/null
+sleep 1
+
+[ -s "$PCAP" ] || { echo "没抓到任何包，检查接口名和机顶盒是否接在本机"; exit 1; }
+echo "抓包完成：$(wc -c < "$PCAP" | tr -d ' ') 字节"
+
+echo "--- 尝试自动提取鉴权参数 ---"
+
+BODY=""
+# 优先找完整表单（含 userToken）
+BODY=$(strings -n 24 "$PCAP" 2>/dev/null | grep -m2 'UserID=' | grep 'userToken=' | head -1)
+# 退而求其次：只要 UserID= 开头
+[ -z "$BODY" ] && BODY=$(strings -n 24 "$PCAP" 2>/dev/null | grep -m1 '^UserID=')
+# 再退：行内截取
+[ -z "$BODY" ] && BODY=$(strings -n 24 "$PCAP" 2>/dev/null | grep -m1 -o 'UserID=[^"]*')
+
+if [ -n "$BODY" ]; then
+	# 去掉可能被粘进来的 HTTP 头尾
+	BODY=$(printf '%s' "$BODY" | sed -e 's/ HTTP\/[0-9.]*.*$//' -e 's/[[:space:]]*$//')
+else
+	echo "自动提取失败。"
+	echo "请手动处理："
+	echo "  1) scp root@$(uci -q get network.lan.ipaddr):$PCAP ."
+	echo "  2) Wireshark 打开，过滤 http，搜 ValidAuthenticationHWCTC"
+	echo "  3) HTML Form URL Encoded -> 复制 As UTF-8 Text"
+	echo "  4) uci set gdiptv.main.auth_body='粘进来'; uci commit gdiptv"
+	exit 1
+fi
+
+echo ""
+echo "提取到的鉴权串（前 120 字符）："
+echo "  $(printf '%s' "$BODY" | cut -c1-120)..."
+echo ""
+
+if printf '%s' "$BODY" | grep -q 'UserID='; then
+	uci -q set gdiptv.main.auth_body="$BODY"
+	uci -q commit gdiptv
+	echo "[OK] 已写入 /etc/config/gdiptv 的 auth_body"
+	echo ""
+	echo "下一步："
+	echo "  gdiptv-update -f      立即重新鉴权并生成列表"
+	echo "  浏览器打开 http://$(uci -q get network.lan.ipaddr)/iptv/ 查看结果"
+else
+	echo "[失败] 提取内容不像鉴权串，未写入配置"
+	exit 1
+fi
+
+exit 0

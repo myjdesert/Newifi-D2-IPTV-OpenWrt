@@ -1,0 +1,9 @@
+# 每天 04:10 跑一次：
+#   - EPG 节目单每次都重新下载
+#   - 频道列表有 7 天缓存，到期会自动重新鉴权
+# 想立刻手刷：ssh 进路由执行 gdiptv-update -f
+10 4 * * * /usr/bin/gdiptv-update >/tmp/gdiptv-update.log 2>&1
+
+# 每周一 05:00 强制重新鉴权一次（RTSP 地址 30 天过期，7 天缓存已够，
+# 这里只是双保险，觉得多余可以删掉）
+0 5 * * 1 /usr/bin/gdiptv-update -f >/tmp/gdiptv-update.log 2>&1

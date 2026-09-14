@@ -1,0 +1,91 @@
+#!/bin/sh
+# ============================================================
+# IPTV 接口 up/down 时：
+#   1. 下发策略路由（183.59 / 10.0.0.0/8 / 组播 走 IPTV 出口）
+#   2. 把 iptv.gd.cn 的解析交给 IPTV 侧 DNS
+#   3. 重启 rtp2httpd / udpxy，让它们绑定新的 pppoe 设备
+#   4. 拨号 60 秒后自动跑一次 gdiptv-update
+# ============================================================
+
+[ "$INTERFACE" = "iptv" ] || exit 0
+[ -f /etc/config/gdiptv ] || exit 0
+
+. /lib/functions.sh
+
+TAG=gdiptv
+log() { logger -t "$TAG" "$*"; }
+
+SUBNETS=$(uci -q get gdiptv.main.iptv_subnets)
+[ -n "$SUBNETS" ] || SUBNETS="183.59.0.0/16 125.88.0.0/16 59.37.0.0/16 202.105.0.0/16 113.108.0.0/16 10.0.0.0/8 224.0.0.0/4"
+
+get_dev() {
+	local d=""
+	local i=0
+	while [ $i -lt 20 ]; do
+		d=$(ifstatus iptv 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null | head -1)
+		[ -n "$d" ] && { echo "$d"; return 0; }
+		i=$((i + 1))
+		sleep 1
+	done
+	return 1
+}
+
+case "$ACTION" in
+ifup)
+	DEV=$(get_dev) || { log "取不到 iptv 的 l3_device，跳过"; exit 0; }
+	log "IPTV 已连接 ($DEV)，下发策略路由"
+
+	for s in $SUBNETS; do
+		ip -4 route replace "$s" dev "$DEV" 2>/dev/null
+	done
+	ip -4 route replace 224.0.0.0/4 dev "$DEV" 2>/dev/null
+
+	# 关反向路径过滤：组播和非对称回程否则会被丢
+	for f in /proc/sys/net/ipv4/conf/*/rp_filter; do
+		echo 0 > "$f" 2>/dev/null
+	done
+	echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null
+
+	# ---- DNS 分流：iptv.gd.cn 走 IPTV DNS ----
+	DNS=$(ifstatus iptv 2>/dev/null | jsonfilter -e '@["dns-server"][0]' 2>/dev/null | head -1)
+	if [ -z "$DNS" ]; then
+		DNS=$(ifstatus iptv 2>/dev/null | grep -oE '"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"' | head -1 | tr -d '"')
+	fi
+	if [ -n "$DNS" ]; then
+		for cur in $(uci -q get dhcp.@dnsmasq[0].server 2>/dev/null); do
+			case "$cur" in
+			/iptv.gd.cn/*) uci -q del_list dhcp.@dnsmasq[0].server="$cur" ;;
+			esac
+		done
+		uci add_list dhcp.@dnsmasq[0].server="/iptv.gd.cn/$DNS" 2>/dev/null
+		uci commit dhcp
+		/etc/init.d/dnsmasq restart
+		log "iptv.gd.cn -> DNS $DNS"
+	else
+		log "未取到 IPTV DNS；gdiptv-update 会退回公网 DNS 解析 eds.iptv.gd.cn"
+	fi
+
+	# ---- 转单播服务重新绑定 ----
+	[ -x /etc/init.d/rtp2httpd ] && /etc/init.d/rtp2httpd restart
+	[ -x /etc/init.d/udpxy ] && {
+		uci -q set udpxy.@udpxy[0].source="$DEV"
+		uci -q commit udpxy
+		/etc/init.d/udpxy restart
+	}
+
+	# ---- 自动刷新一次 ----
+	if [ "$(uci -q get gdiptv.main.enabled)" = "1" ] && [ -n "$(uci -q get gdiptv.main.auth_body)" ]; then
+		(sleep 60; /usr/bin/gdiptv-update >/tmp/gdiptv-update.log 2>&1) &
+	fi
+	;;
+
+ifdown)
+	log "IPTV 断开，回收策略路由"
+	for s in $SUBNETS; do
+		ip -4 route del "$s" 2>/dev/null
+	done
+	ip -4 route del 224.0.0.0/4 2>/dev/null
+	;;
+esac
+
+exit 0

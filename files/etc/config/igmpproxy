@@ -1,0 +1,14 @@
+# 机顶盒需要"原生组播"时才用（默认不启用）
+# 启用: /etc/init.d/igmpproxy enable && /etc/init.d/igmpproxy start
+# 只走 rtp2httpd / udpxy 的话不需要它
+config igmpproxy
+	option quickleave '1'
+
+config phyint
+	option network 'iptv'
+	option direction 'upstream'
+	list altnet '0.0.0.0/0'
+
+config phyint
+	option network 'lan'
+	option direction 'downstream'

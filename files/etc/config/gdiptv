@@ -1,0 +1,42 @@
+# ============================================================
+# 广东电信 IPTV 鉴权 / 频道列表 / 节目单 配置
+# 由 /usr/bin/gdiptv-update 读取
+# ============================================================
+
+config gdiptv 'main'
+	# 1 = 启用自动更新
+	option enabled '1'
+
+	# 【必填】抓包得到的 ValidAuthenticationHWCTC.jsp 的 POST 表单内容
+	# 用 gdiptv-sniff 自动抓取，或手动把整串 UserID=...&...&VIP= 填进来
+	# 例：option auth_body 'UserID=02012345678&Lang=&SupportHD=1&NetUserID=...&userToken=...&VIP='
+	option auth_body ''
+
+	# 直播地址生成方式：
+	#   rtp2httpd -> http://<proxy>/rtp/239.x.x.x:5140   （推荐，含 FCC 快切）
+	#   udpxy     -> http://<proxy>/udp/239.x.x.x:5140
+	#   rtsp      -> 直接用 rtsp:// 单播地址（支持时移回看，但占带宽）
+	option mode 'rtp2httpd'
+
+	# 组播转单播服务地址。留空则用 <LAN IP>:5140
+	# rtp2httpd 默认 5140；udpxy 默认 4022
+	option proxy '192.168.2.1:5140'
+
+	# 节目单（xmltv）。肥羊 EPG 是酷9作者推荐源，自带央卫+地方台
+	option epg_url 'https://epg.v1.mk/fy.xml'
+
+	# 广东电信 EDS 调度服务器（一般不用改）
+	option eds_host 'eds.iptv.gd.cn'
+	option eds_port '8082'
+
+	# 走 IPTV 出口的网段。江门/广东电信常用：
+	# 183.59.x.x  = EPG / RTSP 单播服务器
+	# 10.0.0.0/8  = IPTV 内网
+	# 224.0.0.0/4 = 组播
+	option iptv_subnets '183.59.0.0/16 125.88.0.0/16 59.37.0.0/16 202.105.0.0/16 113.108.0.0/16 10.0.0.0/8 224.0.0.0/4'
+
+	# 频道列表缓存天数（RTSP 地址官方 30 天过期，7 天刷新足够）
+	option cache_days '7'
+
+	# 输出目录（uhttpd 直接对外提供）
+	option output_dir '/www/iptv'

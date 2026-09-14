@@ -1,0 +1,385 @@
+#!/bin/sh
+# ============================================================
+# gdiptv-update — 广东电信 IPTV 鉴权 / 频道列表 / 节目单 自动更新
+#
+# 流程：
+#   1) eds.iptv.gd.cn:8082/EDS/jsp/AuthenticationURL  -> 302 拿到本市 EPG 服务器
+#   2) POST /EPG/jsp/ValidAuthenticationHWCTC.jsp     -> 拿到 Cookie（鉴权）
+#   3) GET  /EPG/jsp/getchannellistHWCTC.jsp          -> 频道列表（igmp + rtsp）
+#   4) 与 /etc/gdiptv/channels.csv 合并 -> 生成 m3u8 / txt / json
+#   5) 下载 xmltv 节目单
+#
+# 用法：
+#   gdiptv-update          正常更新（列表走 7 天缓存，EPG 每次拉）
+#   gdiptv-update -f       强制重新鉴权 + 重拉列表
+#   gdiptv-update -l       只打印平台返回的全部频道 ID/名称（重建 CSV 用）
+#   gdiptv-update -h       帮助
+# ============================================================
+
+set -u
+
+TAG=gdiptv
+CONF=/etc/config/gdiptv
+CSV=/etc/gdiptv/channels.csv
+CACHE=/etc/gdiptv/cache
+TMP=/tmp/gdiptv
+
+[ -f "$CONF" ] || { echo "缺少 $CONF"; exit 1; }
+
+mkdir -p "$TMP" "$CACHE"
+
+log() { logger -t "$TAG" "$*"; echo "$*"; }
+err() { logger -t "$TAG" "ERROR: $*"; echo "ERROR: $*" >&2; }
+
+usage() {
+	cat <<EOF
+用法: gdiptv-update [选项]
+  (无参数)   更新节目单；频道列表走缓存（默认 7 天）后自动重新鉴权
+  -f        强制重新鉴权并刷新频道列表
+  -l        列出平台返回的全部频道 ID 与名称（用于重建 channels.csv）
+  -h        显示帮助
+EOF
+}
+
+FORCE=0
+LISTONLY=0
+while [ $# -gt 0 ]; do
+	case "$1" in
+	-f | --force) FORCE=1 ;;
+	-l | --list) LISTONLY=1 ;;
+	-h | --help) usage; exit 0 ;;
+	*) usage; exit 1 ;;
+	esac
+	shift
+done
+
+# ---------------- 读配置 ----------------
+AUTH_BODY=$(uci -q get gdiptv.main.auth_body)
+MODE=$(uci -q get gdiptv.main.mode); MODE=${MODE:-rtp2httpd}
+PROXY=$(uci -q get gdiptv.main.proxy)
+EPG_URL=$(uci -q get gdiptv.main.epg_url)
+EDS_HOST=$(uci -q get gdiptv.main.eds_host); EDS_HOST=${EDS_HOST:-eds.iptv.gd.cn}
+EDS_PORT=$(uci -q get gdiptv.main.eds_port); EDS_PORT=${EDS_PORT:-8082}
+CACHE_DAYS=$(uci -q get gdiptv.main.cache_days); CACHE_DAYS=${CACHE_DAYS:-7}
+OUT=$(uci -q get gdiptv.main.output_dir); OUT=${OUT:-/www/iptv}
+
+LANIP=$(uci -q get network.lan.ipaddr); LANIP=${LANIP:-192.168.2.1}
+[ -z "$PROXY" ] && PROXY="$LANIP:5140"
+
+mkdir -p "$OUT"
+
+if [ -z "$AUTH_BODY" ]; then
+	err "gdiptv.main.auth_body 为空。先用 gdiptv-sniff 抓包，或手动填入。"
+	exit 1
+fi
+
+# ---------------- 取 IPTV 出口 ----------------
+DEV=$(ifstatus iptv 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null | head -1)
+[ -z "$DEV" ] && DEV=$(ifstatus iptv 2>/dev/null | jsonfilter -e '@.device' 2>/dev/null | head -1)
+if [ -z "$DEV" ]; then
+	err "iptv 接口未连接。检查 PPPoE 账号密码和 LAN4 接线。"
+	exit 1
+fi
+
+DNS=$(ifstatus iptv 2>/dev/null | jsonfilter -e '@["dns-server"][0]' 2>/dev/null | head -1)
+[ -z "$DNS" ] && DNS=$(ifstatus iptv 2>/dev/null | grep -oE '"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"' | head -1 | tr -d '"')
+
+log "IPTV 出口 $DEV，DNS ${DNS:-无}"
+
+# ---------------- 工具函数 ----------------
+is_ip() {
+	case "$1" in
+	*[!0-9.]*) return 1 ;;
+	esac
+	return 0
+}
+
+resolve() {
+	local h="$1" r=""
+	is_ip "$h" && { echo "$h"; return 0; }
+	[ -n "$DNS" ] && r=$(nslookup "$h" "$DNS" 2>/dev/null | awk '/^Address/{print $NF}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | tail -1)
+	[ -z "$r" ] && r=$(nslookup "$h" 223.5.5.5 2>/dev/null | awk '/^Address/{print $NF}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | tail -1)
+	[ -z "$r" ] && r=$(nslookup "$h" 119.29.29.29 2>/dev/null | awk '/^Address/{print $NF}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | tail -1)
+	echo "$r"
+}
+
+route_add() {
+	[ -n "${1:-}" ] && ip -4 route replace "$1" dev "$DEV" 2>/dev/null
+	return 0
+}
+
+cache_fresh() {
+	[ -f "$CACHE/list.raw" ] || return 1
+	local now age mtime
+	now=$(date +%s)
+	mtime=$(date -r "$CACHE/list.raw" +%s 2>/dev/null)
+	[ -z "$mtime" ] && return 1
+	age=$((now - mtime))
+	[ "$age" -lt $((CACHE_DAYS * 86400)) ]
+}
+
+# ---------------- 解析频道列表 ----------------
+parse_channels() {
+	tr -d '\r' < "$1" | awk '
+	{
+		line = $0
+		if (!match(line, /ChannelID="[^"]*"/))   next
+		id = substr(line, RSTART + 11, RLENGTH - 12)
+		if (!match(line, /ChannelName="[^"]*"/)) next
+		name = substr(line, RSTART + 13, RLENGTH - 14)
+		if (!match(line, /ChannelURL="[^"]*"/))  next
+		url = substr(line, RSTART + 12, RLENGTH - 13)
+
+		igmp = ""; rtsp = ""
+		n = split(url, p, "|")
+		for (i = 1; i <= n; i++) {
+			if (p[i] ~ /^[Ii][Gg][Mm][Pp]:\/\//)      igmp = substr(p[i], 8)
+			else if (p[i] ~ /^[Rr][Tt][Ss][Pp]:\/\//) rtsp = p[i]
+		}
+		if (id != "" && name != "" && (igmp != "" || rtsp != ""))
+			printf "%s|%s|%s|%s\n", id, name, igmp, rtsp
+	}' > "$2"
+}
+
+# ---------------- 鉴权 + 拉列表 ----------------
+do_fetch() {
+	local userid edsip loc base bh bip port burl bres
+
+	userid=$(printf '%s' "$AUTH_BODY" | sed -n 's/.*UserID=\([^&]*\).*/\1/p' | head -1)
+	if [ -z "$userid" ]; then
+		err "auth_body 里没找到 UserID 字段"
+		return 1
+	fi
+	log "UserID=$userid"
+
+	# 1) EDS 调度
+	edsip=$(resolve "$EDS_HOST")
+	[ -n "$edsip" ] && route_add "$edsip/32"
+	log "EDS $EDS_HOST -> ${edsip:-未解析}"
+
+	local resopt=""
+	[ -n "$edsip" ] && resopt="--resolve $EDS_HOST:$EDS_PORT:$edsip"
+
+	loc=$(curl -sS --max-time 25 -i $resopt \
+		"http://$EDS_HOST:$EDS_PORT/EDS/jsp/AuthenticationURL?UserID=$userid&Action=Login" 2>/dev/null |
+		tr -d '\r' | awk 'tolower($1)=="location:"{print $2; exit}')
+
+	base=$(printf '%s' "$loc" | sed -n 's#^\(https\?://[^/]*\).*#\1#p')
+	if [ -z "$base" ]; then
+		err "EDS 没返回 Location 头，检查 183.59/10.0.0.0/8 是否已走 IPTV 出口"
+		return 1
+	fi
+	log "EPG 平台 $base"
+
+	bh=$(printf '%s' "$base" | sed -e 's#^https\?://##' -e 's#:.*##' -e 's#/.*##')
+	port=$(printf '%s' "$base" | sed -n 's#^https\?://[^:]*:##p')
+	[ -z "$port" ] && port=8082
+	case "$port" in *[!0-9]*) port=8082 ;; esac
+
+	bip=$(resolve "$bh")
+	[ -n "$bip" ] && route_add "$bip/32"
+	if [ -n "$bip" ]; then
+		burl="http://$bip:$port"
+		bres="--resolve $bh:$port:$bip"
+	else
+		burl="http://$bh:$port"
+		bres=""
+	fi
+
+	# 2) 鉴权
+	rm -f "$TMP/cookie.txt"
+	curl -sS --max-time 30 -c "$TMP/cookie.txt" \
+		-H 'Content-Type: application/x-www-form-urlencoded' \
+		--data-binary "$AUTH_BODY" \
+		"$burl/EPG/jsp/ValidAuthenticationHWCTC.jsp" -o "$TMP/auth.html" 2>/dev/null
+	if [ ! -s "$TMP/cookie.txt" ]; then
+		err "鉴权失败：没拿到 Cookie。auth_body 可能已过期，重新抓包。"
+		return 1
+	fi
+	log "鉴权成功"
+
+	# 3) 频道列表
+	curl -sS --max-time 40 -b "$TMP/cookie.txt" $bres \
+		"$burl/EPG/jsp/getchannellistHWCTC.jsp" -o "$TMP/list.raw" 2>/dev/null
+	if [ ! -s "$TMP/list.raw" ]; then
+		err "频道列表为空"
+		return 1
+	fi
+	cp "$TMP/list.raw" "$CACHE/list.raw"
+	return 0
+}
+
+# ---------------- 取列表（带缓存） ----------------
+if [ "$FORCE" = "1" ] || ! cache_fresh; then
+	if [ "$FORCE" = "1" ]; then log "强制刷新：重新鉴权"; else log "缓存过期：重新鉴权"; fi
+	do_fetch || exit 1
+else
+	cp "$CACHE/list.raw" "$TMP/list.raw"
+	log "使用缓存频道列表（$(date -r "$CACHE/list.raw" '+%F %T')）"
+fi
+
+parse_channels "$TMP/list.raw" "$TMP/ch.txt"
+TOTAL=$(wc -l < "$TMP/ch.txt" | tr -d ' ')
+if [ "${TOTAL:-0}" -eq 0 ]; then
+	err "解析出 0 个频道，列表格式可能变了。原始文件: $TMP/list.raw"
+	exit 1
+fi
+log "平台返回 $TOTAL 个频道"
+
+# -l 只列清单
+if [ "$LISTONLY" = "1" ]; then
+	echo "# 频道ID,频道名,igmp,rtsp"
+	awk -F'|' '{printf "%s,%s,%s,%s\n", $1, $2, ($3==""?"-":$3), ($4==""?"-":$4)}' "$TMP/ch.txt"
+	exit 0
+fi
+
+# ---------------- 与 CSV 合并 ----------------
+MERGED="$TMP/merged.txt"
+: > "$MERGED"
+
+if [ -f "$CSV" ]; then
+	awk -F'|' '
+	FNR == NR {
+		n++
+		K[n] = $1; N[n] = $2; I[n] = $3; R[n] = $4
+		M[$1] = n
+		next
+	}
+	/^channelid,/ { next }
+	{
+		gsub(/\r/, "")
+		if (split($0, c, ",") < 5) next
+		gsub(/^[ \t]+|[ \t]+$/, "", c[1])
+		if (!(c[1] in M)) next
+		i = M[c[1]]
+		printf "%s|%s|%s|%s|%s|%s|%s|%s\n", K[i], N[i], I[i], R[i], c[2], c[3], c[4], c[5]
+	}' "$TMP/ch.txt" "$CSV" > "$MERGED"
+fi
+
+# CSV 一个都没配上 -> 直接用平台原始列表兜底，保证出得来文件
+if [ ! -s "$MERGED" ]; then
+	log "CSV 未匹配到任何频道，改用平台原始列表兜底"
+	awk -F'|' '{printf "%s|%s|%s|%s|%s|%s|%s|%s\n", $1,$2,$3,$4,$2,"IPTV","",$2}' "$TMP/ch.txt" > "$MERGED"
+fi
+
+COUNT=$(wc -l < "$MERGED" | tr -d ' ')
+log "生成 $COUNT 个频道"
+
+# ---------------- 输出 ----------------
+gen_m3u() {
+	# $1: rtp2httpd | udpxy | rtsp ; $2: 输出文件
+	awk -F'|' -v mode="$1" -v proxy="$PROXY" '
+	{
+		id=$1; name=$2; igmp=$3; rtsp=$4; tvg=$5; grp=$6; logo=$7; cn=$8
+		url=""
+		if (mode == "rtsp") {
+			url = rtsp
+			if (url == "" && igmp != "") url = "http://" proxy "/rtp/" igmp
+		} else if (mode == "udpxy") {
+			if (igmp != "") url = "http://" proxy "/udp/" igmp; else url = rtsp
+		} else {
+			if (igmp != "") url = "http://" proxy "/rtp/" igmp; else url = rtsp
+		}
+		if (url == "") next
+		printf "#EXTINF:-1 tvg-id=\"%s\" tvg-name=\"%s\" tvg-logo=\"%s\" group-title=\"%s\",%s\n", id, tvg, logo, grp, cn
+		print url
+	}' "$MERGED" > "$2.tmp"
+	{
+		echo "#EXTM3U"
+		echo "# Generated by gdiptv-update $(date '+%F %T')"
+		cat "$2.tmp"
+	} > "$2"
+	rm -f "$2.tmp"
+}
+
+gen_txt() {
+	awk -F'|' -v mode="$MODE" -v proxy="$PROXY" '
+	{
+		igmp=$3; rtsp=$4; grp=$6; cn=$8
+		url=""
+		if (mode == "rtsp") { url = rtsp; if (url == "" && igmp != "") url = "http://" proxy "/rtp/" igmp }
+		else if (mode == "udpxy") { if (igmp != "") url = "http://" proxy "/udp/" igmp; else url = rtsp }
+		else { if (igmp != "") url = "http://" proxy "/rtp/" igmp; else url = rtsp }
+		if (url == "") next
+		if (grp != last) { printf "%s,#genre#\n", grp; last = grp }
+		printf "%s,%s\n", cn, url
+	}' "$MERGED" > "$1"
+}
+
+gen_m3u "$MODE" "$OUT/iptv.m3u8"
+# 回看/时移专用：全 rtsp 单播，播放器加 &playseek=YYYYMMDDHHMMSS-YYYYMMDDHHMMSS
+gen_m3u "rtsp" "$OUT/iptv-rtsp.m3u8"
+gen_txt "$OUT/iptv.txt"
+
+# 调试用 json
+{
+	echo "{"
+	echo "  \"updated\": \"$(date '+%F %T')\","
+	echo "  \"mode\": \"$MODE\","
+	echo "  \"proxy\": \"$PROXY\","
+	echo "  \"channels\": ["
+	awk -F'|' '{
+		prefix = first ? ",\n" : ""
+		first = 1
+		printf "%s    {\"id\":\"%s\",\"name\":\"%s\",\"igmp\":\"%s\",\"rtsp\":\"%s\"}", prefix, $1, $8, $3, $4
+	}
+	END { if (first) printf "\n" }' "$MERGED"
+	echo "  ]"
+	echo "}"
+} > "$OUT/iptv.json"
+
+# ---------------- 节目单 ----------------
+if [ -n "${EPG_URL:-}" ]; then
+	log "下载节目单 $EPG_URL"
+	if curl -sSL --connect-timeout 15 --max-time 240 "$EPG_URL" -o "$TMP/epg.raw" 2>/dev/null && [ -s "$TMP/epg.raw" ]; then
+		if head -c 2 "$TMP/epg.raw" | od -An -tx1 | tr -d ' \n' | grep -q '^1f8b'; then
+			gzip -dc "$TMP/epg.raw" > "$OUT/epg.xml" 2>/dev/null || cp "$TMP/epg.raw" "$OUT/epg.xml"
+		else
+			cp "$TMP/epg.raw" "$OUT/epg.xml"
+		fi
+		if head -c 4096 "$OUT/epg.xml" | grep -q '<tv'; then
+			log "节目单已更新 ($(wc -c < "$OUT/epg.xml" | tr -d ' ') 字节)"
+		else
+			err "节目单不是 xmltv 格式，已丢弃"
+			rm -f "$OUT/epg.xml"
+		fi
+	else
+		err "节目单下载失败（走的是 WAN，检查外网连通性）"
+	fi
+fi
+
+# ---------------- 索引页 ----------------
+cat > "$OUT/index.html" <<EOF
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>IPTV 列表 - Newifi D2</title>
+<style>
+body{font-family:-apple-system,"Microsoft YaHei",sans-serif;margin:40px;color:#222;background:#f6f7f9}
+h1{font-size:20px}table{border-collapse:collapse;margin-top:16px;background:#fff}
+td,th{border:1px solid #dfe3e8;padding:8px 14px;font-size:14px}
+th{background:#eef1f5;text-align:left}a{color:#0066cc}
+code{background:#eceff3;padding:2px 6px;border-radius:3px}
+</style></head>
+<body>
+<h1>广东电信 IPTV — 自动生成列表</h1>
+<p>最后更新：<b>$(date '+%Y-%m-%d %H:%M:%S')</b>　频道数：<b>$COUNT</b>　模式：<b>$MODE</b></p>
+<table>
+<tr><th>用途</th><th>地址</th></tr>
+<tr><td>直播列表（m3u8）</td><td><a href="iptv.m3u8">/iptv/iptv.m3u8</a></td></tr>
+<tr><td>回看/时移（rtsp 单播）</td><td><a href="iptv-rtsp.m3u8">/iptv/iptv-rtsp.m3u8</a></td></tr>
+<tr><td>酷9/DIYP 文本源</td><td><a href="iptv.txt">/iptv/iptv.txt</a></td></tr>
+<tr><td>节目单（xmltv）</td><td><a href="epg.xml">/iptv/epg.xml</a></td></tr>
+<tr><td>频道明细（json）</td><td><a href="iptv.json">/iptv/iptv.json</a></td></tr>
+<tr><td>rtp2httpd 状态面板</td><td><a href="http://$LANIP:5140/status">http://$LANIP:5140/status</a></td></tr>
+<tr><td>rtp2httpd 网页播放器</td><td><a href="http://$LANIP:5140/player">http://$LANIP:5140/player</a></td></tr>
+<tr><td>udpxy 状态（备用）</td><td><a href="http://$LANIP:4022/status">http://$LANIP:4022/status</a></td></tr>
+</table>
+<p style="margin-top:20px;font-size:13px;color:#666">
+回看：在 rtsp 地址后追加 <code>&amp;playseek=20260101120000-20260101130000</code>（起始-结束，UTC+8）。<br>
+手动刷新：<code>gdiptv-update -f</code>；抓取鉴权：<code>gdiptv-sniff</code>。
+</p>
+</body></html>
+EOF
+
+log "完成：$OUT/iptv.m3u8 / iptv-rtsp.m3u8 / iptv.txt / epg.xml"
+exit 0

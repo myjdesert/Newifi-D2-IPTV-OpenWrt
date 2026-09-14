@@ -1,0 +1,247 @@
+name: Build Newifi D2 IPTV Firmware
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**.md'
+      - '.gitignore'
+
+env:
+  REPO_URL: https://github.com/immortalwrt/immortalwrt.git
+  REPO_TAG: openwrt-24.10
+  CONFIG_FILE: newifi-d2-iptv.config
+  DIY_SH1: diy-part1.sh
+  DIY_SH2: diy-part2.sh
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    name: Build Newifi D2 (广东电信 IPTV)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show build info
+        run: |
+          echo "============================================"
+          echo " Newifi 3 D2 - 广东电信 IPTV 内网融合固件"
+          echo "============================================"
+          echo " Source : ${{ env.REPO_URL }} @ ${{ env.REPO_TAG }}"
+          echo " Target : ramips / mt7621 / d-team_newifi-d2"
+          echo " 拓扑   : 主路由上网 + D2 拨号 IPTV(旁路由)"
+          echo " IPTV   : rtp2httpd + udpxy + igmpproxy + 鉴权/回看/节目单脚本"
+          echo " 时间   : $(date '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "============================================"
+
+      - name: Free disk space
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          sudo rm -rf /usr/local/share/boost /usr/lib/jvm /usr/share/swift
+          sudo apt-get clean
+          sudo apt-get autoremove -y --purge || true
+          df -h /
+
+      - name: Setup build environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo -E apt-get update
+          sudo -E apt-get install -y \
+            build-essential clang flex bison g++ gawk gcc-multilib \
+            g++-multilib gettext git libncurses5-dev libssl-dev \
+            python3-distutils python3-setuptools rsync unzip zlib1g-dev \
+            wget curl time coreutils quilt perl python3-pip
+          sudo -E apt-get clean
+          df -h /
+
+      - name: Create swap file
+        run: |
+          sudo dd if=/dev/zero of=/mnt/swapfile bs=1M count=8192
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -h
+
+      - name: Clone source code
+        run: |
+          git clone --depth 1 --single-branch -b "$REPO_TAG" "$REPO_URL" openwrt
+          cd openwrt
+          echo "=== Git ==="
+          git log -1 --format="%H %ci %s"
+          echo "=== 目标目录探测 ==="
+          ls -d target/linux/ramips target/linux/mediatek 2>/dev/null || true
+          echo "=== 设备定义 ==="
+          grep -rn "d-team_newifi-d2" target/linux/ramips/image/*.mk 2>/dev/null | head -3 || \
+          grep -rn "d-team_newifi-d2" target/linux/mediatek/image/*.mk 2>/dev/null | head -3 || \
+          (echo "!! 未找到设备定义"; exit 1)
+
+      - name: Cache toolchain and dl
+        uses: actions/cache@v4
+        with:
+          path: |
+            openwrt/dl
+            openwrt/staging_dir
+            openwrt/build_dir/host
+          key: ${{ runner.os }}-newifi-d2-${{ env.REPO_TAG }}-${{ hashFiles('configs/newifi-d2-iptv.config') }}
+          restore-keys: |
+            ${{ runner.os }}-newifi-d2-${{ env.REPO_TAG }}-
+
+      - name: Run DIY script (part 1)
+        run: |
+          cd openwrt
+          chmod +x ../scripts/$DIY_SH1
+          ../scripts/$DIY_SH1
+
+      - name: Update and install feeds
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Run DIY script (part 2)
+        run: |
+          cd openwrt
+          chmod +x ../scripts/$DIY_SH2
+          ../scripts/$DIY_SH2
+
+      - name: Apply custom config
+        run: |
+          cd openwrt
+          TARGET_DIR=$(cat /tmp/.gdiptv_target 2>/dev/null || echo ramips)
+          echo "target dir = $TARGET_DIR"
+
+          # 覆盖到 openwrt/files/ —— 只有这个目录会被打进固件 rootfs
+          mkdir -p files
+          cp -r ../files/* files/ 2>/dev/null || true
+          echo "=== Overlay 文件 ==="
+          find files/ -type f | sort
+
+          cp ../configs/$CONFIG_FILE .config
+
+          # ramips/mediatek 改名兼容
+          if [ "$TARGET_DIR" != "ramips" ]; then
+            sed -i "s|CONFIG_TARGET_ramips_mt7621_DEVICE_|CONFIG_TARGET_${TARGET_DIR}_mt7621_DEVICE_|g" .config
+            sed -i "s|^CONFIG_TARGET_ramips=y|CONFIG_TARGET_${TARGET_DIR}=y|g" .config
+            sed -i "s|^CONFIG_TARGET_ramips_mt7621=y|CONFIG_TARGET_${TARGET_DIR}_mt7621=y|g" .config
+          fi
+
+          make defconfig
+
+          echo "=== 设备选择 ==="
+          grep -E "^CONFIG_TARGET.*DEVICE.*=y" .config || true
+          if ! grep -qE "^CONFIG_TARGET_${TARGET_DIR}_mt7621_DEVICE_d-team_newifi-d2=y" .config; then
+            echo "::error::设备 d-team_newifi-d2 未被选中！"
+            exit 1
+          fi
+          echo "[OK] d-team_newifi-d2 已选中"
+
+          echo "=== 关键 IPTV 包 ==="
+          grep -E "^CONFIG_PACKAGE_(rtp2httpd|luci-app-rtp2httpd|udpxy|igmpproxy|curl|tcpdump|ip-full)=" .config || true
+
+          if ! grep -q "^CONFIG_PACKAGE_rtp2httpd=y" .config; then
+            echo "::error::rtp2httpd 未进入 .config，组播转单播将不可用"
+            exit 1
+          fi
+
+          echo "=== 中文语言 ==="
+          grep -E "^CONFIG_LUCI_LANG_zh_Hans=y" .config || echo "  [WARN] 未开启 zh_Hans"
+
+          echo "=== 包数量 ==="
+          grep -c "=y" .config
+
+      - name: Download sources
+        run: |
+          cd openwrt
+          make download -j$(nproc) 2>&1 | tail -20 || {
+            echo "下载失败，单线程重试..."
+            make download -j1 V=s 2>&1 | tail -50
+          }
+
+      - name: Compile firmware
+        run: |
+          cd openwrt
+          echo "编译开始 $(date)"
+          set +e
+          make -j$(nproc) V=s 2>&1 | tee build.log | tail -100
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            echo "===== 首次编译失败(rc=$rc)，单线程重试 ====="
+            make -j1 V=s 2>&1 | tail -300
+            rc=${PIPESTATUS[0]}
+          fi
+          set -e
+          echo "编译结束 $(date) rc=$rc"
+          exit $rc
+
+      - name: Verify firmware images
+        run: |
+          cd openwrt
+          echo "=== 产物 ==="
+          find bin/targets/ -type f \( -name "*.bin" -o -name "*.tar.gz" \) 2>/dev/null
+          if ls bin/targets/*/*/*newifi-d2*squashfs-sysupgrade.bin >/dev/null 2>&1; then
+            echo "[OK] sysupgrade 镜像已生成"
+          else
+            echo "::error::未找到 newifi-d2 sysupgrade 镜像"
+            find bin/targets/ -maxdepth 3 2>/dev/null || true
+            exit 1
+          fi
+
+      - name: Prepare artifacts
+        run: |
+          cd openwrt
+          mkdir -p /tmp/firmware-output
+          find bin/targets/ \( -name "*sysupgrade*" -o -name "*factory*" -o -name "*initramfs*" \) 2>/dev/null | \
+            while read f; do cp "$f" /tmp/firmware-output/; done
+          cp .config /tmp/firmware-output/build-config.txt 2>/dev/null || true
+          cd /tmp/firmware-output
+          sha256sum * > sha256sums.txt 2>/dev/null || true
+          ls -lh /tmp/firmware-output/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: newifi-d2-iptv-firmware-${{ github.run_id }}
+          path: /tmp/firmware-output/*
+          retention-days: 30
+
+      - name: Create release
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: newifi-d2-iptv-${{ github.run_id }}
+          name: Newifi D2 IPTV ${{ github.run_id }}
+          body: |
+            ## Newifi 3 D2 — 广东电信 IPTV 内网融合固件
+
+            **源码**：ImmortalWrt `openwrt-24.10`（ramips/mt7621）
+            **默认 IP**：192.168.2.1（LAN）/ WAN 口 DHCP 上联主路由
+            **IPTV 口**：LAN4（接光猫 ITV），PPPoE 拨号
+
+            ### 自带能力
+            - rtp2httpd（5140）：组播/RTSP → HTTP，支持 FCC 快切、时移回看反代
+            - udpxy（4022）：备用组播转单播
+            - igmpproxy：机顶盒原生组播代理
+            - `gdiptv-update`：EDS 鉴权 → 频道列表 → m3u8/txt + 节目单，每日自动刷新
+            - `gdiptv-sniff`：tcpdump 自动抓机顶盒鉴权包并写入配置
+            - 策略路由：183.59/125.88/59.37/202.105/10.0.0.0/8/组播 走 IPTV
+            - dnsmasq：`iptv.gd.cn` 走 IPTV DNS
+
+            ### 首次使用
+            1. 刷写 `*-squashfs-sysupgrade.bin`
+            2. 改 `/etc/config/network` 里 iptv 接口的账号密码
+            3. `gdiptv-sniff` 抓鉴权包，或手动填 `gdiptv.main.auth_body`
+            4. `gdiptv-update` 生成 `http://192.168.2.1/iptv/iptv.m3u8`
+          files: /tmp/firmware-output/*
+          draft: false
+          prerelease: false
