@@ -124,6 +124,12 @@ jobs:
           # 覆盖到 openwrt/files/ —— 只有这个目录会被打进固件 rootfs
           mkdir -p files
           cp -r ../files/* files/ 2>/dev/null || true
+
+          # Windows/Git 容易丢可执行位，这里统一补回来
+          chmod 0755 files/usr/bin/gdiptv-update files/usr/bin/gdiptv-sniff 2>/dev/null || true
+          chmod 0755 files/etc/hotplug.d/iface/30-gdiptv 2>/dev/null || true
+          chmod 0755 files/etc/uci-defaults/*.sh 2>/dev/null || true
+
           echo "=== Overlay 文件 ==="
           find files/ -type f | sort
 
@@ -137,6 +143,11 @@ jobs:
           fi
 
           make defconfig
+
+          # —— 保险：defconfig 偶尔会清空 DEVICE 行，强制确保设备被选中 ——
+          sed -i 's/^# CONFIG_TARGET_ramips_mt7621_DEVICE_d-team_newifi-d2 is not set/CONFIG_TARGET_ramips_mt7621_DEVICE_d-team_newifi-d2=y/' .config
+          grep -q '^CONFIG_TARGET_ramips_mt7621_DEVICE_d-team_newifi-d2=y' .config \
+            || echo 'CONFIG_TARGET_ramips_mt7621_DEVICE_d-team_newifi-d2=y' >> .config
 
           echo "=== 设备选择 ==="
           grep -E "^CONFIG_TARGET.*DEVICE.*=y" .config || true
@@ -222,26 +233,29 @@ jobs:
           tag_name: newifi-d2-iptv-${{ github.run_id }}
           name: Newifi D2 IPTV ${{ github.run_id }}
           body: |
-            ## Newifi 3 D2 — 广东电信 IPTV 内网融合固件
+            ## Newifi 3 D2 — 广东电信 IPTV 内网融合固件（旁路由 / 同网段）
 
-            **源码**：ImmortalWrt `openwrt-24.10`（ramips/mt7621）
-            **默认 IP**：192.168.2.1（LAN）/ WAN 口 DHCP 上联主路由
-            **IPTV 口**：LAN4（接光猫 ITV），PPPoE 拨号
+            **源码**：ImmortalWrt `openwrt-24.10`（ramips/mt7621 / d-team_newifi-d2）
+            **组网**：旁路由模式，D2 = 192.168.1.2，主路由 = 192.168.1.1，
+                    电视/手机都从主路由拿地址，**同一网段，投屏正常**
+            **IPTV 口**：WAN 口（接光猫 ITV），PPPoE 拨号
 
             ### 自带能力
-            - rtp2httpd（5140）：组播/RTSP → HTTP，支持 FCC 快切、时移回看反代
+            - LuCI → 服务 → 广东电信 IPTV：图形化填写拨号账号/密码/MAC、认证 postBody、EPG 地址
+            - rtp2httpd（5140）：组播 / RTSP → HTTP，支持 FCC 快切、时移回看反代
             - udpxy（4022）：备用组播转单播
             - igmpproxy：机顶盒原生组播代理
-            - `gdiptv-update`：EDS 鉴权 → 频道列表 → m3u8/txt + 节目单，每日自动刷新
+            - `gdiptv-update`：EDS 鉴权 → 频道列表 → m3u8/txt + xmltv 节目单，每日自动刷新
             - `gdiptv-sniff`：tcpdump 自动抓机顶盒鉴权包并写入配置
-            - 策略路由：183.59/125.88/59.37/202.105/10.0.0.0/8/组播 走 IPTV
-            - dnsmasq：`iptv.gd.cn` 走 IPTV DNS
+            - 策略路由：183.59/125.88/59.37/202.105/113.108/10.0.0.0/8/组播 走 IPTV 出口
+            - EPG 默认取 litiande03/epg 每日输出（gzip 自动解压）
 
             ### 首次使用
             1. 刷写 `*-squashfs-sysupgrade.bin`
-            2. 改 `/etc/config/network` 里 iptv 接口的账号密码
-            3. `gdiptv-sniff` 抓鉴权包，或手动填 `gdiptv.main.auth_body`
-            4. `gdiptv-update` 生成 `http://192.168.2.1/iptv/iptv.m3u8`
+            2. 浏览器进 LuCI → **服务 → 广东电信 IPTV**
+            3. 填 IPTV 拨号账号/密码（形如 `020xxxxxxxx@iptv.gd`）、必要时填机顶盒 MAC
+            4. SSH 跑 `gdiptv-sniff` 抓鉴权，或手动把 postBody 粘进「认证中间数据」
+            5. 点「保存并重拨 IPTV」，约 1 分钟后打开 <http://192.168.1.2/iptv/>
           files: /tmp/firmware-output/*
           draft: false
           prerelease: false

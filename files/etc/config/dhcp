@@ -1,7 +1,11 @@
 # ============================================================
 # dnsmasq / DHCP
-# rebind_protection 必须关掉：iptv.gd.cn 会解析到 10.x 私网地址，
-# 开启的话 dnsmasq 会把它当成 DNS rebinding 攻击直接丢掉，鉴权必失败。
+#
+# 旁路由模式：D2 不开 DHCP（主路由负责），只做本地 DNS 解析 + IPTV 域名分流。
+#   noresolv=1  +  server '192.168.1.1'  -> 默认上游走主路由
+#   localuse=1                       -> D2 本机也用 dnsmasq 解析
+#   rebind_protection=0              -> iptv.gd.cn 解析到 10.x 私网不会被当 rebinding 丢弃
+#   hotplug 在 IPTV 拨号成功后追加   -> server=/iptv.gd.cn/<IPTV侧DNS>
 # ============================================================
 
 config dnsmasq
@@ -13,27 +17,18 @@ config dnsmasq
 	option domain 'lan'
 	option expandhosts '1'
 	option cachesize '2048'
-	option authoritative '1'
+	option authoritative '0'
 	option readethers '1'
 	option leasefile '/tmp/dhcp.leases'
-	option resolvfile '/tmp/resolv.conf.d/resolv.conf.auto'
-	option localservice '1'
+	option noresolv '1'
+	option localuse '1'
+	list server '192.168.1.1'
 	option ednspacket_max '1232'
 	option dnsforwardmax '1500'
-	# iptv.gd.cn 交给 IPTV 侧 DNS —— 由 /etc/hotplug.d/iface/30-gdiptv
-	# 在 IPTV 拨号成功后自动写入，形如：
-	# list server '/iptv.gd.cn/10.255.x.x'
 
+# D2 不做 DHCP 服务器（主路由负责），仅保留接口声明
 config dhcp 'lan'
 	option interface 'lan'
-	option start '100'
-	option limit '150'
-	option leasetime '12h'
-	option dhcpv4 'server'
-	option force '1'
-
-config dhcp 'wan'
-	option interface 'wan'
 	option ignore '1'
 
 config dhcp 'iptv'

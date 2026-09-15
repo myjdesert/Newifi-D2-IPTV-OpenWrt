@@ -1,14 +1,16 @@
 # ============================================================
-# Newifi 3 D2 — 主路由上网 + 本机拨号 IPTV（旁路由串在电视与主路由之间）
+# Newifi 3 D2 — 旁路由模式（电视机 / 手机同网段，保证投屏可用）
 #
 # 物理接法（默认）：
-#   WAN 口  -> 主路由 LAN 口            （上网，DHCP）
-#   LAN4    -> 光猫 ITV 口              （IPTV，PPPoE 拨号）
-#   LAN1-3  -> 电视机 / 机顶盒 / 其他   （br-lan，192.168.2.1/24）
-#   无线     -> 默认关闭，需要时到 LuCI 启用
+#   WAN 口  -> 光猫 ITV 口              （IPTV，PPPoE 拨号，独占）
+#   LAN1-4  -> 主路由 LAN / 电视 / 手机  （桥接，192.168.1.0/24 同一网段）
 #
-# 如果你的 IPTV 是单线复用（一根线入户+VLAN），把 iptv 的 device
-# 改成 'wan.45'（45 换成你的 IPTV VLAN ID），见 README。
+# 说明：
+#   - 本机（D2）在 192.168.1.2，主路由在 192.168.1.1；电视/手机都从主路由拿
+#     192.168.1.x 的地址，彼此同网段，DLNA / Miracast / 投屏正常。
+#   - D2 不做 NAT、不开 DHCP（主路由负责），只作为“IPTV 服务盒子”：
+#     组播/RTSP 在 D2 上经 WAN 口的 IPTV 专网拉取，再以 HTTP 回给电视/手机。
+#   - 若你的主路由网段不是 192.168.1.x，把下面的 ipaddr / gateway 改掉即可。
 # ============================================================
 
 config interface 'loopback'
@@ -21,54 +23,36 @@ config globals 'globals'
 	option ula_prefix 'fd8e:5c2d:9a41::/48'
 	option packet_steering '1'
 
-# br-lan 只收 LAN1-3；LAN4 给 IPTV 独占
+# br-lan 桥接 LAN1-4，接主路由 / 电视 / 手机（同一网段）
 config device
 	option name 'br-lan'
 	option type 'bridge'
 	list ports 'lan1'
 	list ports 'lan2'
 	list ports 'lan3'
-	option igmp_snooping '1'
-
-config device
-	option name 'br-lan'
-	option ipv6 '0'
+	list ports 'lan4'
 
 config interface 'lan'
 	option device 'br-lan'
 	option proto 'static'
-	option ipaddr '192.168.2.1'
+	option ipaddr '192.168.1.2'
 	option netmask '255.255.255.0'
-	option ip6assign '60'
+	option gateway '192.168.1.1'
+	option ip6assign '0'
 
-# 上联主路由
-config interface 'wan'
-	option device 'wan'
-	option proto 'dhcp'
-	option hostname 'Newifi-D2-IPTV'
-	option peerdns '1'
-
-config interface 'wan6'
-	option device 'wan'
-	option proto 'dhcpv6'
-	option reqaddress 'try'
-	option reqprefix 'auto'
-	option auto '0'
-
-# ---------------- IPTV（PPPoE） ----------------
+# ---------------- IPTV（PPPoE，走 WAN 口） ----------------
 # 1) username/password 填电信给你的 IPTV 账号（常见形如 020xxxxxxxx@iptv.gd）
 # 2) 若电信把 IPTV 绑定了机顶盒 MAC，取消下面 macaddr 的注释并填机顶盒 MAC
-# 3) defaultroute=0：IPTV 不走默认路由，只靠 /etc/hotplug.d/iface/30-gdiptv
-#    下发 183.59/125.88/59.37/202.105/10.0.0.0/8/组播 的策略路由
+# 3) device 默认 wan（即路由器 WAN 口）；defaultroute=0 表示 IPTV 不抢默认路由，
+#    只靠 /etc/hotplug.d/iface/30-gdiptv 下发 183.59/10.0.0.0/8/组播 的策略路由
 config interface 'iptv'
-	option device 'lan4'
+	option device 'wan'
 	option proto 'pppoe'
 	option username '你的IPTV账号@iptv.gd'
 	option password '你的IPTV密码'
 	# option macaddr 'AA:BB:CC:DD:EE:FF'
 	option defaultroute '0'
 	option peerdns '1'
-	option dns_metric '200'
 	option delegate '0'
 	option ipv6 '0'
 	option metric '20'

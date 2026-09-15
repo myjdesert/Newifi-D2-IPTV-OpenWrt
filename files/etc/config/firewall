@@ -1,6 +1,11 @@
 # ============================================================
-# Newifi D2 IPTV 防火墙
+# Newifi D2 IPTV 防火墙（旁路由模式）
 # 注意：flow offload 会绕过组播/IPTV 的转发路径，务必保持关闭
+#
+# D2 此时是“主机 + IPTV 服务盒”，不是网关，因此只保留：
+#   lan  区：本机对电视/手机开放服务（rtp2httpd/uhttpd/LuCI/SSH）
+#   iptv 区：IPTV 专网，放行 IGMP / 组播 / 本机出访
+# 不做 lan->iptv 的转发（rtp2httpd 等是本机进程，不需要转发规则）
 # ============================================================
 
 config defaults
@@ -19,16 +24,6 @@ config zone
 	list network 'lan'
 
 config zone
-	option name 'wan'
-	option input 'REJECT'
-	option output 'ACCEPT'
-	option forward 'REJECT'
-	option masq '1'
-	option mtu_fix '1'
-	list network 'wan'
-	list network 'wan6'
-
-config zone
 	option name 'iptv'
 	option input 'ACCEPT'
 	option output 'ACCEPT'
@@ -36,41 +31,6 @@ config zone
 	option masq '1'
 	option mtu_fix '1'
 	list network 'iptv'
-
-config forwarding
-	option src 'lan'
-	option dest 'wan'
-
-config forwarding
-	option src 'lan'
-	option dest 'iptv'
-
-# ---------- 基础 ----------
-config rule
-	option name 'Allow-DHCP-Renew'
-	option src 'wan'
-	option proto 'udp'
-	option dest_port '68'
-	option target 'ACCEPT'
-	option family 'ipv4'
-
-config rule
-	option name 'Allow-Ping'
-	option src 'wan'
-	option proto 'icmp'
-	option icmp_type 'echo-request'
-	option family 'ipv4'
-	option target 'ACCEPT'
-
-config rule
-	option name 'Allow-IGMP'
-	option src 'wan'
-	option proto 'igmp'
-	option family 'ipv4'
-	option target 'ACCEPT'
-
-config include
-	option path '/etc/firewall.user'
 
 # ---------- IPTV 组播放行 ----------
 config rule
@@ -103,9 +63,9 @@ config rule
 	option family 'ipv4'
 	option target 'ACCEPT'
 
-# 路由器本机访问 IPTV 平台（鉴权/频道列表/EPT RTSP）需要 NAT
-config nat
-	option name 'IPTV-Masq'
-	option src 'iptv'
-	option proto 'all'
-	option target 'MASQUERADE'
+# 出向 NAT 由 iptv 区的 option masq '1' 负责：
+#   本机 / Bauhinia 进程访问 10.x 的 EPG、RTSP 服务器时源地址会被换成 PPPoE 地址，
+#   保证回程包能原路返回。此处不要再额外加 config nat，方向写反会干扰正常的包。
+
+config include
+	option path '/etc/firewall.user'
