@@ -153,6 +153,14 @@ do_fetch() {
 	log "UserID=$userid"
 
 	# 1) EDS 调度
+	#    若配置里直接指定了 EPG 服务器（gdiptv.main.epg_base），就跳过 EDS。
+	#    用途：EDS 在某些地市不返回 Location，此时可从机顶盒抓包里直接拿到
+	#    真实的 EPG 服务器地址填进来（见 gdiptv-sniff 产出的 pcap）。
+	EPG_BASE=$(uci -q get gdiptv.main.epg_base)
+	if [ -n "$EPG_BASE" ]; then
+		log "使用配置指定的 EPG 服务器 $EPG_BASE（跳过 EDS 调度）"
+		base="$EPG_BASE"
+	else
 	edsip=$(resolve "$EDS_HOST")
 	[ -n "$edsip" ] && route_add "$edsip/32"
 	log "EDS $EDS_HOST -> ${edsip:-未解析}"
@@ -170,6 +178,7 @@ do_fetch() {
 		return 1
 	fi
 	log "EPG 平台 $base"
+	fi
 
 	bh=$(printf '%s' "$base" | sed -e 's#^https\?://##' -e 's#:.*##' -e 's#/.*##')
 	port=$(printf '%s' "$base" | sed -n 's#^https\?://[^:]*:##p')
@@ -199,10 +208,22 @@ do_fetch() {
 	log "鉴权成功"
 
 	# 3) 频道列表
-	curl -sS --max-time 40 -b "$TMP/cookie.txt" $bres \
-		"$burl/EPG/jsp/getchannellistHWCTC.jsp" -o "$TMP/list.raw" 2>/dev/null
+	#    实测有的地市对该接口挑参数/挑 --resolve，这里按组合逐个试并把
+	#    每次的 HTTP 状态码和返回大小打到日志，便于定位。
+	: > "$TMP/list.raw"
+	for opt in "$bres" ""; do
+		for q in "" "?UserID=$userid" "?UserID=$userid&Action=Login"; do
+			code=$(curl -sS --max-time 40 -b "$TMP/cookie.txt" $opt \
+				"$burl/EPG/jsp/getchannellistHWCTC.jsp$q" \
+				-o "$TMP/list.raw" -w '%{http_code}' 2>/dev/null)
+			log "频道列表尝试 ${q:-无参数} $([ -n "$opt" ] && echo 带resolve || echo 无resolve) -> HTTP=${code:-?} 大小=$(wc -c < "$TMP/list.raw" | tr -d ' ')"
+			[ -s "$TMP/list.raw" ] && break 2
+		done
+	done
 	if [ ! -s "$TMP/list.raw" ]; then
-		err "频道列表为空"
+		err "频道列表为空。手动排查："
+		err "  curl -b $TMP/cookie.txt -D - '$burl/EPG/jsp/getchannellistHWCTC.jsp'"
+		err "  cat $TMP/cookie.txt"
 		return 1
 	fi
 	cp "$TMP/list.raw" "$CACHE/list.raw"
