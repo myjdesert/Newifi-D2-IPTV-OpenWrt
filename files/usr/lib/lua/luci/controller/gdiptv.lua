@@ -1,3 +1,5 @@
+module("luci.controller.gdiptv", package.seeall)
+
 -- 广东电信 IPTV —— LuCI 菜单入口
 
 function index()
