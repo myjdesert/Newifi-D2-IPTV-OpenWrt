@@ -32,6 +32,18 @@ config zone
 	option mtu_fix '1'
 	list network 'iptv'
 
+# ------------------------------------------------------------
+# 关键：允许 LAN 下的机顶盒/播放器把流量转发进 IPTV 专网
+#
+# 之前这里没有 forwarding，导致 forward 链默认 drop，
+# 机顶盒即便把网关指向 D2 也完全不通（表现：能拿到地址但鉴权失败、
+# ping 不通 10.x / 125.88.x）。rtp2httpd/gdiptv-update 是本机进程走
+# output 链不受影响，所以只在本机跑脚本时看不出问题，一接机顶盒就暴露。
+# ------------------------------------------------------------
+config forwarding
+	option src 'lan'
+	option dest 'iptv'
+
 # ---------- IPTV 组播放行 ----------
 config rule
 	option name 'IPTV-Allow-IGMP'

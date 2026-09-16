@@ -52,6 +52,16 @@ ifup)
 		DNS=$(ifstatus iptv 2>/dev/null | grep -oE '"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"' | head -1 | tr -d '"')
 	fi
 	if [ -n "$DNS" ]; then
+		# 关键：给 PPPoE 下发的 DNS 服务器本身加 /32 路由走 IPTV 出口。
+		# 否则 dnsmasq 去查 202.96.128.86 这类地址时会走默认路由（主路由），
+		# 主路由既解析不了 iptv.gd.cn，也可能根本没接（D2 单独调试时），
+		# 结果就是 nslookup 超时 -> 机顶盒拿不到鉴权服务器地址。
+		for d in $(ifstatus iptv 2>/dev/null | jsonfilter -e '@["dns-server"][*]' 2>/dev/null); do
+			case "$d" in
+			*[0-9].*[0-9].*[0-9].*[0-9]) ip -4 route replace "$d" dev "$DEV" 2>/dev/null ;;
+			esac
+		done
+
 		for cur in $(uci -q get dhcp.@dnsmasq[0].server 2>/dev/null); do
 			case "$cur" in
 			/iptv.gd.cn/*) uci -q del_list dhcp.@dnsmasq[0].server="$cur" ;;
@@ -60,7 +70,7 @@ ifup)
 		uci add_list dhcp.@dnsmasq[0].server="/iptv.gd.cn/$DNS" 2>/dev/null
 		uci commit dhcp
 		/etc/init.d/dnsmasq restart
-		log "iptv.gd.cn -> DNS $DNS"
+		log "iptv.gd.cn -> DNS $DNS（已加 $DEV 直连路由）"
 	else
 		log "未取到 IPTV DNS；gdiptv-update 会退回公网 DNS 解析 eds.iptv.gd.cn"
 	fi
