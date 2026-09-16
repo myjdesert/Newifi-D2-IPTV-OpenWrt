@@ -38,8 +38,14 @@ echo "--------------------------------------------"
 echo " >>> 现在请重启（断电再上电）电信机顶盒 <<<"
 echo "============================================"
 
-tcpdump -i "$IFACE" -s 0 -w "$PCAP" \
-	"tcp port 8082 or tcp port 8080 or tcp port 80" >/dev/null 2>&1 &
+# 抓全部 TCP（排除 SSH 自身）。
+# 注意：不要只过滤 80/8080/8082 —— EPG 鉴权服务器端口各地市不同
+# （实测江门是 33200），只抓这几个端口会漏掉真正的
+# ValidAuthenticationHWCTC.jsp 的 POST，脚本会误把 EDS 的
+# GET 查询串（UserID=xxx&Action=Login）当成 postBody 写进配置，
+# 结果鉴权拿到空 JSESSIONID、拉列表 302 到 SessionTimeOut.jsp。
+# 组播视频是 UDP，用 tcp 过滤天然不会录进去，文件很小。
+tcpdump -i "$IFACE" -s 0 -w "$PCAP" "tcp and not port 22" >/dev/null 2>&1 &
 PID=$!
 
 # 倒计时
@@ -58,19 +64,33 @@ echo "抓包完成：$(wc -c < "$PCAP" | tr -d ' ') 字节"
 
 echo "--- 尝试自动提取鉴权参数 ---"
 
-BODY=""
-# 优先找完整表单（含 userToken）
-BODY=$(strings -n 24 "$PCAP" 2>/dev/null | grep -m2 'UserID=' | grep 'userToken=' | head -1)
-# 退而求其次：只要 UserID= 开头
-[ -z "$BODY" ] && BODY=$(strings -n 24 "$PCAP" 2>/dev/null | grep -m1 '^UserID=')
-# 再退：行内截取
-[ -z "$BODY" ] && BODY=$(strings -n 24 "$PCAP" 2>/dev/null | grep -m1 -o 'UserID=[^"]*')
+# 真正的 postBody 必须带 userToken 或 Authenticator。
+# EDS 的 GET 查询串（UserID=xxx&Action=Login）也含 UserID=，必须排除，
+# 否则会写进一个假 body -> 鉴权返回空 JSESSIONID -> 拉列表 302 SessionTimeOut。
+grep_body() {
+	strings -n 24 "$PCAP" 2>/dev/null |
+		grep 'UserID=' |
+		grep -E 'userToken=|Authenticator=' |
+		grep -v 'Action=Login' |
+		head -1
+}
+
+BODY=$(grep_body)
 
 if [ -n "$BODY" ]; then
 	# 去掉可能被粘进来的 HTTP 头尾
 	BODY=$(printf '%s' "$BODY" | sed -e 's/ HTTP\/[0-9.]*.*$//' -e 's/[[:space:]]*$//')
 else
-	echo "自动提取失败。"
+	echo "自动提取失败：抓包里没有找到带 userToken/Authenticator 的鉴权表单。"
+	echo
+	echo "常见原因："
+	echo "  1) 抓包期间机顶盒没有真正重启（要断电再上电，不是待机唤醒）"
+	echo "  2) 机顶盒走的不是本机（检查它是否接在 D2 的 LAN 口 / 连的 D2 的 WiFi）"
+	echo "  3) 机顶盒用 HTTPS 或端口不在抓包范围内（本脚本已抓全部 TCP，此条较少见）"
+	echo
+	echo "若抓包里只出现 'UserID=xxx&Action=Login'，那是 EDS 的 GET 查询串，"
+	echo "不是 postBody，写了也没用。"
+	echo
 	echo "请手动处理："
 	echo "  1) scp root@$(uci -q get network.lan.ipaddr):$PCAP ."
 	echo "  2) Wireshark 打开，过滤 http，搜 ValidAuthenticationHWCTC"

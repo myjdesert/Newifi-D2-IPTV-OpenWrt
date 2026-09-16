@@ -197,12 +197,23 @@ do_fetch() {
 
 	# 2) 鉴权
 	rm -f "$TMP/cookie.txt"
+	rm -f "$TMP/auth.html"
 	curl -sS --max-time 30 -c "$TMP/cookie.txt" \
 		-H 'Content-Type: application/x-www-form-urlencoded' \
 		--data-binary "$AUTH_BODY" \
 		"$burl/EPG/jsp/ValidAuthenticationHWCTC.jsp" -o "$TMP/auth.html" 2>/dev/null
-	if [ ! -s "$TMP/cookie.txt" ]; then
-		err "鉴权失败：没拿到 Cookie。auth_body 可能已过期，重新抓包。"
+
+	# 注意：鉴权失败时平台照样会下发一个值为空的 JSESSIONID（Set-Cookie: JSESSIONID="";），
+	# 「cookie 文件非空」是假成功。必须校验存在值非空的 cookie。
+	if ! grep -v '^#' "$TMP/cookie.txt" 2>/dev/null |
+		awk 'NF >= 7 && $7 != "" && $7 != "\"\"" { found = 1 } END { exit !found }'; then
+		err "鉴权失败：没有拿到有效的会话 Cookie。"
+		if grep -q 'isSucessed *= *false' "$TMP/auth.html" 2>/dev/null; then
+			err "平台返回 isSucessed=false —— auth_body 不对或已过期。"
+			err "若 auth_body 形如 'UserID=xxx&Action=Login'，那是 EDS 的 GET 查询串、"
+			err "不是鉴权 postBody（gdiptv-sniff 旧版端口过滤不全时会抓错），请重新抓包。"
+		fi
+		err "平台原始返回已保存到 $TMP/auth.html"
 		return 1
 	fi
 	log "鉴权成功"
