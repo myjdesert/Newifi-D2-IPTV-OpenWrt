@@ -1,16 +1,20 @@
-config rtp2httpd
-	option disabled '0'
-	option respawn '1'
-	option port '5140'
-	# 上游接口用 netifd 逻辑名，rtp2httpd 会自行解析成 pppoe-iptv
-	option upstream_interface 'iptv'
-	# MT7621 双核，worker 给 2 即可；4K 频道多的话可以调到 4
+# rtp2httpd —— 组播/RTSP 转 HTTP（主服务，直播与时移回看都靠它）
+# 注意：段类型必须是 instance，且必须 option enabled '1'，启动脚本才会拉起进程
+# 启动脚本的合法选项：enabled / listen / upstream_interface / workers /
+#   maxclients / buffer_pool_max_size / udp_rcvbuf_size / mcast_rejoin_interval /
+#   cors_allow_origin / status_page_path / player_page_path 等
+# （port / disabled / respawn 不是合法选项，脚本不认）
+
+config instance 'rtp2httpd'
+	option enabled '1'
+	option listen '0.0.0.0:5140'
+	# 上游接 IPTV 专网口（PPPoE 拨号后生成的真实设备名）
+	option upstream_interface 'pppoe-iptv'
 	option workers '2'
 	option maxclients '30'
 	option buffer_pool_max_size '16384'
 	option udp_rcvbuf_size '524288'
-	# 部分运营商组播会静默断流，60 秒周期性重新加组更稳
 	option mcast_rejoin_interval '60'
+	option cors_allow_origin '*'
 	option status_page_path '/status'
 	option player_page_path '/player'
-	option cors_allow_origin '*'

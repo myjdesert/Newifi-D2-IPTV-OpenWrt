@@ -267,7 +267,7 @@ log "生成 $COUNT 个频道"
 
 # ---------------- 输出 ----------------
 gen_m3u() {
-	# $1: rtp2httpd | udpxy | rtsp ; $2: 输出文件
+	# $1: rtp2httpd | rtsp ; $2: 输出文件
 	awk -F'|' -v mode="$1" -v proxy="$PROXY" '
 	{
 		id=$1; name=$2; igmp=$3; rtsp=$4; tvg=$5; grp=$6; logo=$7; cn=$8
@@ -275,8 +275,6 @@ gen_m3u() {
 		if (mode == "rtsp") {
 			url = rtsp
 			if (url == "" && igmp != "") url = "http://" proxy "/rtp/" igmp
-		} else if (mode == "udpxy") {
-			if (igmp != "") url = "http://" proxy "/udp/" igmp; else url = rtsp
 		} else {
 			if (igmp != "") url = "http://" proxy "/rtp/" igmp; else url = rtsp
 		}
@@ -298,7 +296,6 @@ gen_txt() {
 		igmp=$3; rtsp=$4; grp=$6; cn=$8
 		url=""
 		if (mode == "rtsp") { url = rtsp; if (url == "" && igmp != "") url = "http://" proxy "/rtp/" igmp }
-		else if (mode == "udpxy") { if (igmp != "") url = "http://" proxy "/udp/" igmp; else url = rtsp }
 		else { if (igmp != "") url = "http://" proxy "/rtp/" igmp; else url = rtsp }
 		if (url == "") next
 		if (grp != last) { printf "%s,#genre#\n", grp; last = grp }
@@ -372,7 +369,6 @@ code{background:#eceff3;padding:2px 6px;border-radius:3px}
 <tr><td>频道明细（json）</td><td><a href="iptv.json">/iptv/iptv.json</a></td></tr>
 <tr><td>rtp2httpd 状态面板</td><td><a href="http://$LANIP:5140/status">http://$LANIP:5140/status</a></td></tr>
 <tr><td>rtp2httpd 网页播放器</td><td><a href="http://$LANIP:5140/player">http://$LANIP:5140/player</a></td></tr>
-<tr><td>udpxy 状态（备用）</td><td><a href="http://$LANIP:4022/status">http://$LANIP:4022/status</a></td></tr>
 </table>
 <p style="margin-top:20px;font-size:13px;color:#666">
 回看：在 rtsp 地址后追加 <code>&amp;playseek=20260101120000-20260101130000</code>（起始-结束，UTC+8）。<br>

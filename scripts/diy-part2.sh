@@ -90,7 +90,7 @@ echo "[3/4] -"
 
 # --- 4. 关键包检查 ---
 echo "[4/4] 关键包检查:"
-for p in rtp2httpd luci-app-rtp2httpd udpxy luci-app-udpxy igmpproxy curl tcpdump ip-full kmod-8021q luci-theme-argon; do
+for p in rtp2httpd luci-app-rtp2httpd igmpproxy curl tcpdump ip-full kmod-8021q luci-theme-argon; do
     if find package/ feeds/ -mindepth 2 -maxdepth 3 -type d -name "$p" 2>/dev/null | grep -q .; then
         echo "    [OK] $p"
     else
@@ -101,7 +101,7 @@ done
 echo ""
 echo "============================================"
 echo " Target : ${TARGET_DIR}/mt7621/d-team_newifi-d2"
-echo " IPTV   : rtp2httpd(5140) + udpxy(4022) + igmpproxy"
+echo " IPTV   : rtp2httpd(5140) + igmpproxy"
 echo " 鉴权   : /usr/bin/gdiptv-update (EDS + ValidAuthenticationHWCTC)"
 echo "============================================"
 echo "DIY Part 2 完成。"

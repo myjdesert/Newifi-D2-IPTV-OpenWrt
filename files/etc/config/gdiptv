@@ -20,8 +20,7 @@ config gdiptv 'main'
 	option auth_body ''
 
 	# 直播地址生成方式：
-	#   rtp2httpd -> http://<proxy>/rtp/239.x.x.x:5140   （推荐，含 FCC 快切）
-	#   udpxy     -> http://<proxy>/udp/239.x.x.x:5140
+	#   rtp2httpd -> http://<proxy>/rtp/239.x.x.x:5140   （默认，含 FCC 快切）
 	#   rtsp      -> 直接用 rtsp:// 单播地址（支持时移回看，但占带宽）
 	option mode 'rtp2httpd'
 

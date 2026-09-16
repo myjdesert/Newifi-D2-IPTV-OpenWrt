@@ -5,7 +5,7 @@
 
 | 能力 | 实现 |
 |---|---|
-| 直播组播转单播 | **rtp2httpd**（5140，FCC 快切 + 内置网页播放器），备用 **udpxy**（4022） |
+| 直播组播转单播 | **rtp2httpd**（5140，FCC 快切 + 内置网页播放器） |
 | 时移 / 回看 | RTSP 单播地址 + `playseek` 参数；rtp2httpd 可把 RTSP 反代为 HTTP |
 | 鉴权 | `gdiptv-update` 重放 `ValidAuthenticationHWCTC.jsp`，自动拿 Cookie 拉频道列表 |
 | 频道列表 | 与 `channels.csv`（186 个广东/央卫频道，含台标与分组）合并生成 m3u8 / txt |
@@ -208,7 +208,7 @@ IPTV 拨号成功后自动下发（网段可在 `/etc/config/gdiptv` 的 `iptv_s
 同时会：
 - 关闭 `rp_filter`（否则组播和非对称回程会被丢）
 - 把 `iptv.gd.cn` 的解析交给 IPTV 侧 DNS
-- 重启 rtp2httpd / udpxy 绑定新的 `pppoe-iptv`
+- 重启 rtp2httpd 绑定新的 `pppoe-iptv`
 
 ### dnsmasq
 
@@ -231,7 +231,7 @@ IPTV 拨号成功后自动下发（网段可在 `/etc/config/gdiptv` 的 `iptv_s
 | 频道列表 0 条 | `gdiptv-update -f` 后看 `/tmp/gdiptv/list.raw`；可能 auth_body 过期，重新 `gdiptv-sniff` |
 | CSV 匹配不上（列表只有几十个或名字不对） | `gdiptv-update -l > /tmp/all.csv` 看平台真实 ID，重建 `/etc/gdiptv/channels.csv`（脚本已内置"全不匹配就用平台原始列表"兜底） |
 | 直播能看，回看不行 | 回看走 RTSP 单播，确认 `183.59.0.0/16` 已走 IPTV 出口且防火墙 `iptv` 区开了 masq |
-| 播放卡顿 / 花屏 | 先换 udpxy 对比（4022）；再试把 `/etc/sysctl.d/30-iptv.conf` 里 `force_igmp_version=2` 打开 |
+| 播放卡顿 / 花屏 | 把 `/etc/sysctl.d/30-iptv.conf` 里 `force_igmp_version=2` 打开；或调大 `udp_rcvbuf_size` |
 | 换台慢 | rtp2httpd 的 FCC 需要本地 FCC 服务器地址，抓包找 `ChannelFCCIP/ChannelFCCPort`，填到 LuCI → 服务 → rtp2httpd |
 | 电视能看 IPTV 但上不了网 | 检查 WAN 口是否接主路由 LAN、wan 接口是否 DHCP 拿到地址 |
 | 节目单下不动 | EPG 走的是 WAN（外网），不是 IPTV 专网；先确认 `curl -I https://epg.v1.mk/fy.xml` 通 |
@@ -258,8 +258,7 @@ files/etc/config/network            # WAN=DHCP / LAN4=IPTV PPPoE
 files/etc/config/firewall           # iptv 区 + 组播放行 + 关闭 offload
 files/etc/config/dhcp               # dnsmasq（关闭 rebind_protection）
 files/etc/config/gdiptv             # 鉴权/模式/EPG/网段
-files/etc/config/rtp2httpd          # 5140，上游 iptv
-files/etc/config/udpxy              # 4022 备用
+files/etc/config/rtp2httpd          # 5140，上游 pppoe-iptv
 files/etc/hotplug.d/iface/30-gdiptv # 策略路由 + DNS 分流
 files/etc/uci-defaults/99-gd-iptv.sh
 files/usr/bin/gdiptv-update         # 鉴权 + 列表 + 节目单

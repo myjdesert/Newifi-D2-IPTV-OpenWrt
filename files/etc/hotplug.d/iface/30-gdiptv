@@ -3,7 +3,7 @@
 # IPTV 接口 up/down 时：
 #   1. 下发策略路由（183.59 / 10.0.0.0/8 / 组播 走 IPTV 出口）
 #   2. 把 iptv.gd.cn 的解析交给 IPTV 侧 DNS
-#   3. 重启 rtp2httpd / udpxy，让它们绑定新的 pppoe 设备
+#   3. 重启 rtp2httpd，让它们绑定新的 pppoe 设备
 #   4. 拨号 60 秒后自动跑一次 gdiptv-update
 # ============================================================
 
@@ -67,11 +67,6 @@ ifup)
 
 	# ---- 转单播服务重新绑定 ----
 	[ -x /etc/init.d/rtp2httpd ] && /etc/init.d/rtp2httpd restart
-	[ -x /etc/init.d/udpxy ] && {
-		uci -q set udpxy.@udpxy[0].source="$DEV"
-		uci -q commit udpxy
-		/etc/init.d/udpxy restart
-	}
 
 	# ---- 自动刷新一次 ----
 	if [ "$(uci -q get gdiptv.main.enabled)" = "1" ] && [ -n "$(uci -q get gdiptv.main.auth_body)" ]; then

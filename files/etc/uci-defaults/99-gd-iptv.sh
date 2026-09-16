@@ -51,7 +51,6 @@ fi
 # ---------- 服务自启 ----------
 /etc/init.d/cron enable
 [ -x /etc/init.d/rtp2httpd ] && /etc/init.d/rtp2httpd enable
-[ -x /etc/init.d/udpxy ] && /etc/init.d/udpxy enable
 # igmpproxy 默认不开：只有机顶盒要原生组播才需要
 [ -x /etc/init.d/igmpproxy ] && /etc/init.d/igmpproxy disable
 
