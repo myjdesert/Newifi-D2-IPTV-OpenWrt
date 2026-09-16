@@ -6,11 +6,12 @@
 | 能力 | 实现 |
 |---|---|
 | 直播组播转单播 | **rtp2httpd**（5140，FCC 快切 + 内置网页播放器） |
-| 时移 / 回看 | RTSP 单播地址 + `playseek` 参数；rtp2httpd 可把 RTSP 反代为 HTTP |
+| 时移 / 回看 | 取 `TimeShiftURL` + `playseek` 占位符，与直播**合并成同一条** `catchup-source` |
 | 鉴权 | `gdiptv-update` 重放 `ValidAuthenticationHWCTC.jsp`，自动拿 Cookie 拉频道列表 |
-| 频道列表 | 与 `channels.csv`（186 个广东/央卫频道，含台标与分组）合并生成 m3u8 / txt |
-| 节目单 | 每日自动拉 xmltv（默认肥羊 `https://epg.v1.mk/fy.xml`），缓存到 `/iptv/epg.xml` |
+| 频道列表 | 套用 `channels.m3u` 模板（199 频道）决定**分组与排序**，直播+回看合一输出 |
+| 节目单 | litiande03/epg 每日输出 `pl.xml.gz`，自动解压缓存到 `/iptv/epg.xml` |
 | 抓包 | `gdiptv-sniff` 一条命令抓机顶盒鉴权包并自动写配置 |
+| 联动 | 生成后自动把列表地址写入 `rtp2httpd.external_m3u`，回看由它转 HTTP |
 
 ---
 
@@ -132,44 +133,87 @@ uci commit gdiptv
 gdiptv-update -f
 ```
 
-浏览器打开 **`http://192.168.2.1/iptv/`** 看结果：
+浏览器打开 **`http://192.168.1.2/iptv/`** 看结果：
 
 | 文件 | 用途 |
 |---|---|
-| `iptv.m3u8` | 直播列表，走 rtp2httpd 组播转单播 |
-| `iptv-rtsp.m3u8` | 全 RTSP 单播，**支持时移回看** |
+| `playlist.m3u8` | **主列表**：直播 + 回看合一，已按模板分好组排好序 |
 | `iptv.txt` | 酷9 / DIYP 文本源格式 |
 | `epg.xml` | xmltv 节目单 |
-| `iptv.json` | 频道明细（调试） |
+
+直播走 rtp2httpd 组播转单播；回看写在每条的 `catchup-source` 里，
+播放器按 EPG 选"回看"时会自动拼接时间参数。
 
 ### 4. 播放器配置
 
-- **酷9 / DIYP / TVBox**：订阅 `http://192.168.2.1/iptv/iptv.txt`，
-  EPG 填 `http://192.168.2.1/iptv/epg.xml`
-- **TiviMate / APTV / PotPlayer / VLC**：订阅 `http://192.168.2.1/iptv/iptv.m3u8`
-- **rtp2httpd 自带播放器**：`http://192.168.2.1:5140/player`
-- **状态面板**：`http://192.168.2.1:5140/status`
+- **酷9 / DIYP / TVBox**：订阅 `http://192.168.1.2/iptv/iptv.txt`，
+  EPG 填 `http://192.168.1.2/iptv/epg.xml`
+- **TiviMate / APTV / mytv-android**：订阅 `http://192.168.1.2/iptv/playlist.m3u8`
+  （这两个能识别 `catchup-source`，回看直接可用）
+- **rtp2httpd 自带播放器**：`http://192.168.1.2:5140/player`
+- **rtp2httpd 转好的列表**：`http://192.168.1.2:5140/playlist.m3u`
+- **状态面板**：`http://192.168.1.2:5140/status`
+
+> `gdiptv-update` 每次跑完会把 `http://127.0.0.1/iptv/playlist.m3u8`
+> 自动写进 `rtp2httpd.external_m3u`。rtp2httpd 会定时拉取它并把里面的
+> `rtsp://` 回看源转成 HTTP，所以用它自己的 `/player` 或 `/playlist.m3u`
+> 看回看最省事，电视/手机不需要能直连 IPTV 专网。
+
+### 5. 调整分组与排序
+
+分组和频道顺序由模板 **`/etc/gdiptv/channels.m3u`** 决定，直接编辑它即可，
+改完跑一次 `gdiptv-update -f` 生效。
+
+```m3u
+#EXTINF:-1 tvg-id="广东珠江" tvg-name="广东珠江" group-title="广东",广东珠江
+#EXTINF:-1 tvg-id="广东新闻" tvg-name="广东新闻" group-title="广东",广东新闻
+```
+
+- **调顺序**：上下移动这几行
+- **换分组**：改 `group-title` 的值
+- **改 EPG 名**：改 `tvg-id`（播放器靠它匹配节目单）
+- **加台**：追加一行就行，名字跟平台返回的对上即可（`gdiptv-update -l` 可查）
+
+模板自带 199 个频道，分组顺序为 **广东 / 央视 / 卫视 / 体育 / 儿童 / 其他**。
+
+几个细节：
+
+- 模板里没收录的新频道**不会丢**，会按内置规则自动归类，排在对应分组末尾
+- 同一频道在模板里可以出现多次（分到不同组），例如广东体育同属"广东"和"体育"、
+  CCTV-5 同属"央视"和"体育"，这样"体育"组里能直接找到它
+- 模板里收录的频道会**豁免**垃圾过滤。电信常把可用的高清源标成
+  `CCTV5＋体育高清-测试` 这种名字，不豁免的话会被当成测试流丢掉；
+  显示名仍会用模板里你写的干净名字
+- 同名多路（高清/超清/4K）自动合并，只留清晰度最高的一路
 
 ---
 
 ## 五、回看 / 时移
 
-频道列表里的 RTSP 地址本身就支持 `playseek`：
+回看地址取自频道列表里的 **`TimeShiftURL`** 属性（不是 `ChannelURL` 里的 rtsp，
+那个不能时移），拼上 `playseek` 占位符后写进 `catchup-source`：
 
 ```
-rtsp://183.59.x.x/PLTV/...smil?accountinfo=...&playseek=20260101120000-20260101130000
+rtsp://125.88.52.199/PLTV/...smil?accountinfo=...&playseek=${(b)yyyyMMddHHmmss}-${(e)yyyyMMddHHmmss}
 ```
 
-`playseek=起始时间-结束时间`，格式 `YYYYMMDDHHMMSS`（北京时间）。
-酷9 / DIYP 会在你选"回看"时自动拼接这个参数，所以只要网络通就能直接回看。
+播放器选"回看"时会把 `${(b)...}` / `${(e)...}` 换成实际的起止时间
+（`YYYYMMDDHHMMSS`，北京时间）。
 
-想让不支持 RTSP 的播放器也能回看，用 rtp2httpd 反代：
+如果你的播放器回看时间点整体差 8 小时，改 `gdiptv.main.catchup_tz_offset`
+为 `28800` 或 `-28800` 即可。
+
+不支持 RTSP 的播放器，把 `gdiptv.main.catchup_via_proxy` 设为 `1`，
+`catchup-source` 会直接写成 rtp2httpd 的反代地址：
 
 ```
-http://192.168.2.1:5140/rtsp/183.59.x.x/PLTV/....smil?accountinfo=...&playseek=...
+http://192.168.1.2:5140/rtsp/125.88.52.199:554/PLTV/....smil?accountinfo=...&playseek=...
 ```
 
-> RTSP 地址有效期官方标 30 天。`gdiptv-update` 默认 7 天重新鉴权一次，
+注意：本固件默认 `catchup_via_proxy=0`（原始 rtsp），因为 rtp2httpd 通过
+`external_m3u` 会自动完成这层转换，写两遍反而可能重复包装。
+
+> 时移地址有效期官方标 30 天。`gdiptv-update` 默认 7 天重新鉴权一次，
 > cron 里还配了每周一强制刷新，基本不会断。
 
 ---
@@ -229,8 +273,10 @@ IPTV 拨号成功后自动下发（网段可在 `/etc/config/gdiptv` 的 `iptv_s
 | IPTV 拨不上号 | `logread -e pppd`；确认 LAN4 接的是光猫 ITV 口；试填 `macaddr` |
 | 拨上了但鉴权失败 | `logread -e gdiptv`；看 `gdiptv-update -f` 输出；确认 `183.59` 路由在不在：`ip route \| grep 183.59` |
 | 频道列表 0 条 | `gdiptv-update -f` 后看 `/tmp/gdiptv/list.raw`；可能 auth_body 过期，重新 `gdiptv-sniff` |
-| CSV 匹配不上（列表只有几十个或名字不对） | `gdiptv-update -l > /tmp/all.csv` 看平台真实 ID，重建 `/etc/gdiptv/channels.csv`（脚本已内置"全不匹配就用平台原始列表"兜底） |
-| 直播能看，回看不行 | 回看走 RTSP 单播，确认 `183.59.0.0/16` 已走 IPTV 出口且防火墙 `iptv` 区开了 masq |
+| 某些台没出来 | `gdiptv-update -l` 对比平台真实频道名，补进 `/etc/gdiptv/channels.m3u` 模板（名字对不上时会自动归类到末尾，不会丢） |
+| 频道顺序不对 | 改 `/etc/gdiptv/channels.m3u` 的行顺序，再 `gdiptv-update -f` |
+| 直播能看，回看不行 | 回看源是 `TimeShiftURL`（`125.88.x.x`），确认该网段已走 IPTV 出口；用 rtp2httpd 的 `/player` 看能否回看，排除播放器不支持 rtsp 的问题 |
+| 回看时间差 8 小时 | 设 `gdiptv.main.catchup_tz_offset` 为 `28800` 或 `-28800` |
 | 播放卡顿 / 花屏 | 把 `/etc/sysctl.d/30-iptv.conf` 里 `force_igmp_version=2` 打开；或调大 `udp_rcvbuf_size` |
 | 换台慢 | rtp2httpd 的 FCC 需要本地 FCC 服务器地址，抓包找 `ChannelFCCIP/ChannelFCCPort`，填到 LuCI → 服务 → rtp2httpd |
 | 电视能看 IPTV 但上不了网 | 检查 WAN 口是否接主路由 LAN、wan 接口是否 DHCP 拿到地址 |
@@ -257,13 +303,14 @@ scripts/diy-part2.sh                # 注入 rtp2httpd
 files/etc/config/network            # WAN=DHCP / LAN4=IPTV PPPoE
 files/etc/config/firewall           # iptv 区 + 组播放行 + 关闭 offload
 files/etc/config/dhcp               # dnsmasq（关闭 rebind_protection）
-files/etc/config/gdiptv             # 鉴权/模式/EPG/网段
-files/etc/config/rtp2httpd          # 5140，上游 pppoe-iptv
+files/etc/config/gdiptv             # 鉴权/回看/模板/EPG/网段
+files/etc/config/rtp2httpd          # 5140，上游 pppoe-iptv + external_m3u
 files/etc/hotplug.d/iface/30-gdiptv # 策略路由 + DNS 分流
 files/etc/uci-defaults/99-gd-iptv.sh
-files/usr/bin/gdiptv-update         # 鉴权 + 列表 + 节目单
+files/usr/bin/gdiptv-update         # 鉴权 + 列表(直播+回看) + 节目单
 files/usr/bin/gdiptv-sniff          # 抓包取鉴权
-files/etc/gdiptv/channels.csv       # 186 频道（台标/分组/EPG 名）
+files/etc/gdiptv/channels.m3u       # 频道模板：分组 / 排序 / EPG 名（199 条）
+files/etc/gdiptv/logo.csv           # 台标映射（可选）
 files/etc/crontabs/root             # 每日 04:10 自动更新
 ```
 
@@ -274,7 +321,7 @@ files/etc/crontabs/root             # 每日 04:10 自动更新
 - 恩山原帖（GD 电信 RTSP 抓取 + 酷9/Redstar）：<https://www.right.com.cn/forum/thread-8413871-1-1.html>
 - GD 电信自助鉴权 + 播放列表：<https://mozz.ie/posts/gdct-iptv-auth-and-fetch-playlist/>
 - 导出 m3u8：<https://mozz.ie/posts/extracting-iptv-live-streams/>
-- rtp2httpd：<https://github.com/stackia/rtp2httpd>
-- 肥羊 EPG：<https://epg.v1.mk/fy.xml>
+- rtp2httpd：<https://github.com/stackia/rtp2httpd>（URL 格式 / 时移 / M3U 集成见 <https://rtp2httpd.com>）
+- litiande03 EPG：<https://github.com/litiande03/epg>
 
 > 频道列表里的 RTSP 地址带有你机顶盒的鉴权信息，**不要外传**。

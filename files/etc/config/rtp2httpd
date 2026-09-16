@@ -18,3 +18,11 @@ config instance 'rtp2httpd'
 	option cors_allow_origin '*'
 	option status_page_path '/status'
 	option player_page_path '/player'
+
+	# 外部 M3U：填 gdiptv-update 生成的合并列表（直播组播 + RTSP 回看）。
+	# rtp2httpd 会定时拉取它，并把列表里的 rtsp:// 回看源自动转成
+	# /rtsp/<服务器:端口>/<路径> 的 HTTP 地址，于是网页播放器与
+	# http://<路由IP>:5140/playlist.m3u 都能直接看回看。
+	# 该值由 /usr/bin/gdiptv-update 每次生成列表后自动写入，一般不用手动改。
+	option external_m3u 'http://127.0.0.1/iptv/playlist.m3u8'
+	option external_m3u_update_interval '3600'

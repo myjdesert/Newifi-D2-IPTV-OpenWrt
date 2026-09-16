@@ -1,5 +1,5 @@
 # ============================================================
-# 广东电信 IPTV 鉴权 / 频道列表 / 节目单 配置
+# 广东电信 IPTV 鉴权 / 频道列表 / 回看 / 节目单 配置
 # 由 /usr/bin/gdiptv-update 读取；也可在 LuCI → 服务 → 广东电信 IPTV 里填写
 # ============================================================
 
@@ -7,7 +7,7 @@ config gdiptv 'main'
 	# 1 = 启用定时自动更新
 	option enabled '1'
 
-	# ---- IPTV 专网 PPPoE（写入 network.iptv，由 LuCI“保存并生成”同步）----
+	# ---- IPTV 专网 PPPoE（写入 network.iptv，由 LuCI“保存并重拨”同步）----
 	# 账号形如 020xxxxxxxx@iptv.gd；MAC 为机顶盒 MAC（电信绑定才填）
 	option username ''
 	option password ''
@@ -19,25 +19,46 @@ config gdiptv 'main'
 	# 用 gdiptv-sniff 自动抓取，或手动粘贴整串
 	option auth_body ''
 
-	# 直播地址生成方式：
-	#   rtp2httpd -> http://<proxy>/rtp/239.x.x.x:5140   （默认，含 FCC 快切）
-	#   rtsp      -> 直接用 rtsp:// 单播地址（支持时移回看，但占带宽）
-	option mode 'rtp2httpd'
-
 	# 组播转单播服务地址。留空则自动用 <LAN IP>:5140
 	option proxy ''
+
+	# FCC 快切服务器（毫秒级换台）。江门 125.88.52.199:8027；
+	# 抓包或看机顶盒配置可拿到本地的实际值
+	option fcc_server '125.88.52.199:8027'
+
+	# ---- 回看 ----
+	# 0 = catchup-source 写原始 rtsp://，交给 rtp2httpd 的 external_m3u 自动转 HTTP
+	#     （推荐：电视/手机不必能直连 IPTV 专网）
+	# 1 = 直接写成 http://<proxy>/rtsp/... 给不支持 rtsp 的播放器
+	option catchup_via_proxy '0'
+	# 回看时间点若整体差 8 小时，填 28800 或 -28800
+	option catchup_tz_offset '0'
+	# 1 = 自身没有时移源的频道，借用同频道其它清晰度的回看地址
+	option catchup_borrow '1'
+
+	# ---- 频道模板（分组 / 排序 / EPG 名）----
+	# 编辑这个文件即可调整播放列表的分组与频道顺序。
+	# 模板里没有的频道不会丢失，会自动归类并排到各组末尾。
+	option channel_template '/etc/gdiptv/channels.m3u'
+	# 模板之外的兜底分组顺序（新频道按此归类）
+	option group_order '广东,央视,卫视,体育,儿童,其他'
+	# 同名多路清晰度的取舍：quality=留最清晰 / catchup=优先能回看 / all=全保留
+	option dedup_mode 'quality'
+	# 台标映射（频道名,tvg-logo），可删
+	option logo_file '/etc/gdiptv/logo.csv'
 
 	# 节目单（xmltv）—— 默认 litiande03 每日输出（gzip，脚本自动解压）
 	option epg_url 'https://raw.githubusercontent.com/litiande03/epg/refs/heads/master/pl.xml.gz'
 
-	# 广东电信 EDS 调度服务器（一般不用改）
+	# 广东电信 EDS 调度服务器（一般不用改）。
+	# 若 EDS 在你所在城市不返回 Location，可把真实 EPG 服务器填到 epg_base 跳过调度
 	option eds_host 'eds.iptv.gd.cn'
 	option eds_port '8082'
+	option epg_base ''
 
 	# 走 IPTV 出口的网段。广东电信常用：
-	# 183.59.x.x  = EPG / RTSP 单播服务器
-	# 10.0.0.0/8  = IPTV 内网
-	# 224.0.0.0/4 = 组播
+	# 183.59.x.x / 125.88.x.x / 59.37.x.x = EPG / RTSP 单播服务器
+	# 10.0.0.0/8 = IPTV 内网；224.0.0.0/4 = 组播
 	option iptv_subnets '183.59.0.0/16 125.88.0.0/16 59.37.0.0/16 202.105.0.0/16 113.108.0.0/16 10.0.0.0/8 224.0.0.0/4'
 
 	# 频道列表缓存天数（RTSP 地址官方 30 天过期，7 天刷新足够）

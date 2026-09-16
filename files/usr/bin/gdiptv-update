@@ -1,18 +1,23 @@
 #!/bin/sh
 # ============================================================
-# gdiptv-update — 广东电信 IPTV 鉴权 / 频道列表 / 节目单 自动更新
+# gdiptv-update — 广东电信 IPTV 鉴权 / 频道列表 / 回看 / 节目单 自动更新
 #
 # 流程：
 #   1) eds.iptv.gd.cn:8082/EDS/jsp/AuthenticationURL  -> 302 拿到本市 EPG 服务器
 #   2) POST /EPG/jsp/ValidAuthenticationHWCTC.jsp     -> 拿到 Cookie（鉴权）
-#   3) GET  /EPG/jsp/getchannellistHWCTC.jsp          -> 频道列表（igmp + rtsp）
-#   4) 与 /etc/gdiptv/channels.csv 合并 -> 生成 m3u8 / txt / json
-#   5) 下载 xmltv 节目单
+#   3) GET  /EPG/jsp/getchannellistHWCTC.jsp          -> 频道列表
+#   4) 解析：
+#        ChannelURL  里的 igmp://   -> 直播，走 rtp2httpd 组播转单播
+#        TimeShiftURL（TimeShift=1）-> 回看，RTSP 单播 + playseek 占位符
+#   5) 套用 /etc/gdiptv/channels.m3u 频道模板（分组 / 排序 / EPG 名）
+#   6) 直播与回看合并成一条 catchup-source，输出 playlist.m3u8
+#   7) 把列表地址写入 rtp2httpd 的 external_m3u（它会自动把 rtsp 回看转成 HTTP）
+#   8) 下载 xmltv 节目单
 #
 # 用法：
-#   gdiptv-update          正常更新（列表走 7 天缓存，EPG 每次拉）
+#   gdiptv-update          正常更新（列表走缓存，EPG 每次拉）
 #   gdiptv-update -f       强制重新鉴权 + 重拉列表
-#   gdiptv-update -l       只打印平台返回的全部频道 ID/名称（重建 CSV 用）
+#   gdiptv-update -l       只打印平台返回的全部频道 ID/名称（重建模板用）
 #   gdiptv-update -h       帮助
 # ============================================================
 
@@ -20,7 +25,8 @@ set -u
 
 TAG=gdiptv
 CONF=/etc/config/gdiptv
-CSV=/etc/gdiptv/channels.csv
+TPL=$(uci -q get gdiptv.main.channel_template); TPL=${TPL:-/etc/gdiptv/channels.m3u}
+LOGOCONF=$(uci -q get gdiptv.main.logo_file); LOGOCONF=${LOGOCONF:-/etc/gdiptv/logo.csv}
 CACHE=/etc/gdiptv/cache
 TMP=/tmp/gdiptv
 
@@ -36,7 +42,7 @@ usage() {
 用法: gdiptv-update [选项]
   (无参数)   更新节目单；频道列表走缓存（默认 7 天）后自动重新鉴权
   -f        强制重新鉴权并刷新频道列表
-  -l        列出平台返回的全部频道 ID 与名称（用于重建 channels.csv）
+  -l        列出平台返回的全部频道 ID 与名称（用于重建频道模板）
   -h        显示帮助
 EOF
 }
@@ -62,8 +68,17 @@ EDS_HOST=$(uci -q get gdiptv.main.eds_host); EDS_HOST=${EDS_HOST:-eds.iptv.gd.cn
 EDS_PORT=$(uci -q get gdiptv.main.eds_port); EDS_PORT=${EDS_PORT:-8082}
 CACHE_DAYS=$(uci -q get gdiptv.main.cache_days); CACHE_DAYS=${CACHE_DAYS:-7}
 OUT=$(uci -q get gdiptv.main.output_dir); OUT=${OUT:-/www/iptv}
+EPG_BASE=$(uci -q get gdiptv.main.epg_base)
 
-LANIP=$(uci -q get network.lan.ipaddr); LANIP=${LANIP:-192.168.2.1}
+GROUP_ORDER=$(uci -q get gdiptv.main.group_order)
+GROUP_ORDER=${GROUP_ORDER:-广东,央视,卫视,体育,儿童,其他}
+DEDUP=$(uci -q get gdiptv.main.dedup_mode); DEDUP=${DEDUP:-quality}
+BORROW=$(uci -q get gdiptv.main.catchup_borrow); BORROW=${BORROW:-1}
+CATCHUP_PROXY=$(uci -q get gdiptv.main.catchup_via_proxy); CATCHUP_PROXY=${CATCHUP_PROXY:-0}
+TZ_OFFSET=$(uci -q get gdiptv.main.catchup_tz_offset); TZ_OFFSET=${TZ_OFFSET:-0}
+FCC=$(uci -q get gdiptv.main.fcc_server); FCC=${FCC:-125.88.52.199:8027}
+
+LANIP=$(uci -q get network.lan.ipaddr); LANIP=${LANIP:-192.168.1.2}
 [ -z "$PROXY" ] && PROXY="$LANIP:5140"
 
 mkdir -p "$OUT"
@@ -77,7 +92,7 @@ fi
 DEV=$(ifstatus iptv 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null | head -1)
 [ -z "$DEV" ] && DEV=$(ifstatus iptv 2>/dev/null | jsonfilter -e '@.device' 2>/dev/null | head -1)
 if [ -z "$DEV" ]; then
-	err "iptv 接口未连接。检查 PPPoE 账号密码和 LAN4 接线。"
+	err "iptv 接口未连接。检查 PPPoE 账号密码和物理接线。"
 	exit 1
 fi
 
@@ -118,29 +133,6 @@ cache_fresh() {
 	[ "$age" -lt $((CACHE_DAYS * 86400)) ]
 }
 
-# ---------------- 解析频道列表 ----------------
-parse_channels() {
-	tr -d '\r' < "$1" | awk '
-	{
-		line = $0
-		if (!match(line, /ChannelID="[^"]*"/))   next
-		id = substr(line, RSTART + 11, RLENGTH - 12)
-		if (!match(line, /ChannelName="[^"]*"/)) next
-		name = substr(line, RSTART + 13, RLENGTH - 14)
-		if (!match(line, /ChannelURL="[^"]*"/))  next
-		url = substr(line, RSTART + 12, RLENGTH - 13)
-
-		igmp = ""; rtsp = ""
-		n = split(url, p, "|")
-		for (i = 1; i <= n; i++) {
-			if (p[i] ~ /^[Ii][Gg][Mm][Pp]:\/\//)      igmp = substr(p[i], 8)
-			else if (p[i] ~ /^[Rr][Tt][Ss][Pp]:\/\//) rtsp = p[i]
-		}
-		if (id != "" && name != "" && (igmp != "" || rtsp != ""))
-			printf "%s|%s|%s|%s\n", id, name, igmp, rtsp
-	}' > "$2"
-}
-
 # ---------------- 鉴权 + 拉列表 ----------------
 do_fetch() {
 	local userid edsip loc base bh bip port burl bres
@@ -152,32 +144,28 @@ do_fetch() {
 	fi
 	log "UserID=$userid"
 
-	# 1) EDS 调度
-	#    若配置里直接指定了 EPG 服务器（gdiptv.main.epg_base），就跳过 EDS。
-	#    用途：EDS 在某些地市不返回 Location，此时可从机顶盒抓包里直接拿到
-	#    真实的 EPG 服务器地址填进来（见 gdiptv-sniff 产出的 pcap）。
-	EPG_BASE=$(uci -q get gdiptv.main.epg_base)
+	# 1) EDS 调度（配置里直接指定了 EPG 服务器就跳过）
 	if [ -n "$EPG_BASE" ]; then
 		log "使用配置指定的 EPG 服务器 $EPG_BASE（跳过 EDS 调度）"
 		base="$EPG_BASE"
 	else
-	edsip=$(resolve "$EDS_HOST")
-	[ -n "$edsip" ] && route_add "$edsip/32"
-	log "EDS $EDS_HOST -> ${edsip:-未解析}"
+		edsip=$(resolve "$EDS_HOST")
+		[ -n "$edsip" ] && route_add "$edsip/32"
+		log "EDS $EDS_HOST -> ${edsip:-未解析}"
 
-	local resopt=""
-	[ -n "$edsip" ] && resopt="--resolve $EDS_HOST:$EDS_PORT:$edsip"
+		local resopt=""
+		[ -n "$edsip" ] && resopt="--resolve $EDS_HOST:$EDS_PORT:$edsip"
 
-	loc=$(curl -sS --max-time 25 -i $resopt \
-		"http://$EDS_HOST:$EDS_PORT/EDS/jsp/AuthenticationURL?UserID=$userid&Action=Login" 2>/dev/null |
-		tr -d '\r' | awk 'tolower($1)=="location:"{print $2; exit}')
+		loc=$(curl -sS --max-time 25 -i $resopt \
+			"http://$EDS_HOST:$EDS_PORT/EDS/jsp/AuthenticationURL?UserID=$userid&Action=Login" 2>/dev/null |
+			tr -d '\r' | awk 'tolower($1)=="location:"{print $2; exit}')
 
-	base=$(printf '%s' "$loc" | sed -n 's#^\(https\?://[^/]*\).*#\1#p')
-	if [ -z "$base" ]; then
-		err "EDS 没返回 Location 头，检查 183.59/10.0.0.0/8 是否已走 IPTV 出口"
-		return 1
-	fi
-	log "EPG 平台 $base"
+		base=$(printf '%s' "$loc" | sed -n 's#^\(https\?://[^/]*\).*#\1#p')
+		if [ -z "$base" ]; then
+			err "EDS 没返回 Location 头，检查 IPTV 专网网段是否已走 $DEV"
+			return 1
+		fi
+		log "EPG 平台 $base"
 	fi
 
 	bh=$(printf '%s' "$base" | sed -e 's#^https\?://##' -e 's#:.*##' -e 's#/.*##')
@@ -196,22 +184,20 @@ do_fetch() {
 	fi
 
 	# 2) 鉴权
-	rm -f "$TMP/cookie.txt"
-	rm -f "$TMP/auth.html"
+	rm -f "$TMP/cookie.txt" "$TMP/auth.html"
 	curl -sS --max-time 30 -c "$TMP/cookie.txt" \
 		-H 'Content-Type: application/x-www-form-urlencoded' \
 		--data-binary "$AUTH_BODY" \
 		"$burl/EPG/jsp/ValidAuthenticationHWCTC.jsp" -o "$TMP/auth.html" 2>/dev/null
 
-	# 注意：鉴权失败时平台照样会下发一个值为空的 JSESSIONID（Set-Cookie: JSESSIONID="";），
-	# 「cookie 文件非空」是假成功。必须校验存在值非空的 cookie。
+	# 鉴权失败时平台照样会下发一个值为空的 JSESSIONID，必须校验 cookie 值非空
 	if ! grep -v '^#' "$TMP/cookie.txt" 2>/dev/null |
 		awk 'NF >= 7 && $7 != "" && $7 != "\"\"" { found = 1 } END { exit !found }'; then
 		err "鉴权失败：没有拿到有效的会话 Cookie。"
 		if grep -q 'isSucessed *= *false' "$TMP/auth.html" 2>/dev/null; then
 			err "平台返回 isSucessed=false —— auth_body 不对或已过期。"
 			err "若 auth_body 形如 'UserID=xxx&Action=Login'，那是 EDS 的 GET 查询串、"
-			err "不是鉴权 postBody（gdiptv-sniff 旧版端口过滤不全时会抓错），请重新抓包。"
+			err "不是鉴权 postBody，请重新用 gdiptv-sniff 抓包。"
 		fi
 		err "平台原始返回已保存到 $TMP/auth.html"
 		return 1
@@ -219,8 +205,6 @@ do_fetch() {
 	log "鉴权成功"
 
 	# 3) 频道列表
-	#    实测有的地市对该接口挑参数/挑 --resolve，这里按组合逐个试并把
-	#    每次的 HTTP 状态码和返回大小打到日志，便于定位。
 	: > "$TMP/list.raw"
 	for opt in "$bres" ""; do
 		for q in "" "?UserID=$userid" "?UserID=$userid&Action=Login"; do
@@ -234,7 +218,6 @@ do_fetch() {
 	if [ ! -s "$TMP/list.raw" ]; then
 		err "频道列表为空。手动排查："
 		err "  curl -b $TMP/cookie.txt -D - '$burl/EPG/jsp/getchannellistHWCTC.jsp'"
-		err "  cat $TMP/cookie.txt"
 		return 1
 	fi
 	cp "$TMP/list.raw" "$CACHE/list.raw"
@@ -250,112 +233,362 @@ else
 	log "使用缓存频道列表（$(date -r "$CACHE/list.raw" '+%F %T')）"
 fi
 
-parse_channels "$TMP/list.raw" "$TMP/ch.txt"
-TOTAL=$(wc -l < "$TMP/ch.txt" | tr -d ' ')
-if [ "${TOTAL:-0}" -eq 0 ]; then
-	err "解析出 0 个频道，列表格式可能变了。原始文件: $TMP/list.raw"
-	exit 1
-fi
-log "平台返回 $TOTAL 个频道"
-
-# -l 只列清单
+# -l：只列平台原始清单（重建模板用）
 if [ "$LISTONLY" = "1" ]; then
-	echo "# 频道ID,频道名,igmp,rtsp"
-	awk -F'|' '{printf "%s,%s,%s,%s\n", $1, $2, ($3==""?"-":$3), ($4==""?"-":$4)}' "$TMP/ch.txt"
+	tr -d '\r\n' < "$TMP/list.raw" |
+		sed -e "s/CTCSetConfig('Channel',[ ]*'/\n/g" -e "s/');/\n/g" |
+		grep -i 'ChannelID=' |
+		awk '{
+			if (!match($0, /ChannelID="[^"]*"/))   next
+			id = substr($0, RSTART + 11, RLENGTH - 12)
+			if (!match($0, /ChannelName="[^"]*"/)) next
+			nm = substr($0, RSTART + 13, RLENGTH - 14)
+			printf "%s,%s\n", id, nm
+		}'
 	exit 0
 fi
 
-# ---------------- 与 CSV 合并 ----------------
-MERGED="$TMP/merged.txt"
-: > "$MERGED"
+# ============================================================
+# 播放列表生成引擎
+# ============================================================
+build_awk() {
+	cat <<'AWKEOF'
+function getattr(s, key,   re, m) {
+  # 必须是完整属性名。电信列表里属性用「",」逗号连接（如 GuardEncType=2",TimeShiftURL="rtsp://...），
+  # 并非空格，因此前导边界要允许任意非标识符字符；同时要求 key 后紧跟 = ，
+  # 否则 getattr(s,"TimeShift") 会误命中 TimeShiftDuration / TimeShiftURL。
+  re = "(^|[^A-Za-z0-9_-])" key "[ \t]*=[ \t]*\"[^\"]*\""
+  if (!match(s, re)) return ""
+  m = substr(s, RSTART, RLENGTH)
+  sub(/^[^"]*"/, "", m)
+  sub(/"$/, "", m)
+  return m
+}
+function has(s, k) { return index(s, k) > 0 }
 
-if [ -f "$CSV" ]; then
-	awk -F'|' '
-	FNR == NR {
-		n++
-		K[n] = $1; N[n] = $2; I[n] = $3; R[n] = $4
-		M[$1] = n
-		next
-	}
-	/^channelid,/ { next }
-	{
-		gsub(/\r/, "")
-		if (split($0, c, ",") < 5) next
-		gsub(/^[ \t]+|[ \t]+$/, "", c[1])
-		if (!(c[1] in M)) next
-		i = M[c[1]]
-		printf "%s|%s|%s|%s|%s|%s|%s|%s\n", K[i], N[i], I[i], R[i], c[2], c[3], c[4], c[5]
-	}' "$TMP/ch.txt" "$CSV" > "$MERGED"
-fi
-
-# CSV 一个都没配上 -> 直接用平台原始列表兜底，保证出得来文件
-if [ ! -s "$MERGED" ]; then
-	log "CSV 未匹配到任何频道，改用平台原始列表兜底"
-	awk -F'|' '{printf "%s|%s|%s|%s|%s|%s|%s|%s\n", $1,$2,$3,$4,$2,"IPTV","",$2}' "$TMP/ch.txt" > "$MERGED"
-fi
-
-COUNT=$(wc -l < "$MERGED" | tr -d ' ')
-log "生成 $COUNT 个频道"
-
-# ---------------- 输出 ----------------
-gen_m3u() {
-	# $1: rtp2httpd | rtsp ; $2: 输出文件
-	awk -F'|' -v mode="$1" -v proxy="$PROXY" '
-	{
-		id=$1; name=$2; igmp=$3; rtsp=$4; tvg=$5; grp=$6; logo=$7; cn=$8
-		url=""
-		if (mode == "rtsp") {
-			url = rtsp
-			if (url == "" && igmp != "") url = "http://" proxy "/rtp/" igmp
-		} else {
-			if (igmp != "") url = "http://" proxy "/rtp/" igmp; else url = rtsp
-		}
-		if (url == "") next
-		printf "#EXTINF:-1 tvg-id=\"%s\" tvg-name=\"%s\" tvg-logo=\"%s\" group-title=\"%s\",%s\n", id, tvg, logo, grp, cn
-		print url
-	}' "$MERGED" > "$2.tmp"
-	{
-		echo "#EXTM3U"
-		echo "# Generated by gdiptv-update $(date '+%F %T')"
-		cat "$2.tmp"
-	} > "$2"
-	rm -f "$2.tmp"
+# 清晰度等级：4K > 超清 > 高清 > 标清 > 无标注
+function qual(n) {
+  if (has(n,"4K") || has(n,"4k") || has(n,"超高清")) return 4
+  if (has(n,"超清")) return 3
+  if (has(n,"高清")) return 2
+  if (has(n,"标清") || has(n,"1M")) return 1
+  return 0
 }
 
-gen_txt() {
-	awk -F'|' -v mode="$MODE" -v proxy="$PROXY" '
-	{
-		igmp=$3; rtsp=$4; grp=$6; cn=$8
-		url=""
-		if (mode == "rtsp") { url = rtsp; if (url == "" && igmp != "") url = "http://" proxy "/rtp/" igmp }
-		else { if (igmp != "") url = "http://" proxy "/rtp/" igmp; else url = rtsp }
-		if (url == "") next
-		if (grp != last) { printf "%s,#genre#\n", grp; last = grp }
-		printf "%s,%s\n", cn, url
-	}' "$MERGED" > "$1"
+# 频道名归一：同一频道的 高清/超清/4K 副本用它归并成同一个键
+function norm(n,   k, base) {
+  k = n
+  # 电信列表里用的是全角符号（如 "CCTV5＋体育高清-测试"），先转半角，
+  # 否则全角 ＋ 会让 CCTV-5+ 归并失败、或被当成另一个频道。
+  gsub(/＋/, "+", k)
+  gsub(/－/, "-", k)
+  gsub(/　/, " ", k)
+  sub(/^CCTV[ \t]+-/, "CCTV-", k)
+  sub(/^CETV[ \t]+-/, "CETV-", k)
+  gsub(/\([^)]*\)/, "", k)
+  gsub(/（[^）]*）/, "", k)
+  gsub(/[ \t]+/, "", k)
+  if (substr(k, 1, 4) == "CCTV") {
+    if (has(k,"4K") || has(k,"4k")) return "CCTV-4K"
+    # 台号后的 + 必须保留：CCTV-5+ 是独立的付费赛事频道，不能并进 CCTV-5
+    if (match(k, /^CCTV-?[0-9]+\+?/)) {
+      base = substr(k, 1, RLENGTH)
+      gsub(/CCTV-?/, "CCTV-", base)
+      if (has(k,"欧洲")) return base "-欧洲"
+      if (has(k,"美洲")) return base "-美洲"
+      return base
+    }
+  }
+  if (substr(k, 1, 4) == "CETV") {
+    if (match(k, /^CETV-?[0-9]+/)) { base = substr(k, 1, RLENGTH); gsub(/CETV-?/, "CETV-", base); return base }
+  }
+  gsub(/4K超高清|4k超高清|超高清|4K|4k|超清|高清|标清/, "", k)
+  gsub(/25P|50P|25p|50p|窄色域/, "", k)
+  gsub(/[ \t]+/, "", k)
+  sub(/-+$/, "", k)
+  return k
 }
 
-gen_m3u "$MODE" "$OUT/iptv.m3u8"
-# 回看/时移专用：全 rtsp 单播，播放器加 &playseek=YYYYMMDDHHMMSS-YYYYMMDDHHMMSS
-gen_m3u "rtsp" "$OUT/iptv-rtsp.m3u8"
-gen_txt "$OUT/iptv.txt"
+# 垃圾/技术流过滤
+function isjunk(n) {
+  if (has(n,"广告") || has(n,"购物") || has(n,"商城") || has(n,"促销")) return 1
+  if (has(n,"推广") || has(n,"直销") || has(n,"优选") || has(n,"精选")) return 1
+  if (has(n,"测试") || has(n,"Test") || has(n,"TEST") || has(n,"test")) return 1
+  if (has(n,"调试") || has(n,"临时") || has(n,"DEMO") || has(n,"demo")) return 1
+  if (has(n,"演示") || has(n,"导视") || has(n,"试用")) return 1
+  if (has(n,"时移专用")) return 1
+  if (has(n,"西班牙语") || has(n,"法语") || has(n,"阿拉伯语") || has(n,"俄语")) return 1
+  if (has(n,"韩语") || has(n,"日语") || has(n,"德语") || has(n,"葡萄牙语")) return 1
+  if (has(n,"意大利语") || has(n,"越南语") || has(n,"泰语")) return 1
+  if (has(n,"同播") || has(n,"窄色域") || has(n,"开机标清") || has(n,"校正")) return 1
+  if (has(n,"4M") || has(n,"-1M")) return 1
+  return 0
+}
 
-# 调试用 json
+# 兜底自动分类（仅用于模板里没收录的新频道）
+function cls(n) {
+  if (has(n,"体育") || has(n,"足球") || has(n,"篮球") || has(n,"网球")) return "体育"
+  if (has(n,"台球") || has(n,"高尔夫") || has(n,"赛车") || has(n,"汽摩")) return "体育"
+  if (has(n,"奥林匹克") || has(n,"赛事") || has(n,"竞技")) return "体育"
+  if (has(n,"CCTV-5") || has(n,"CCTV5") || has(n,"CCTV-16")) return "体育"
+  if (has(n,"少儿") || has(n,"卡通") || has(n,"动画") || has(n,"早期教育")) return "儿童"
+  if (has(n,"育儿") || has(n,"幼儿") || has(n,"儿童") || has(n,"青少")) return "儿童"
+  if (has(n,"KIDS") || has(n,"Kids") || has(n,"CARTOON") || has(n,"Cartoon")) return "儿童"
+  if (has(n,"卫视")) { if (has(n,"广东") || has(n,"大湾区")) return "广东"; return "卫视" }
+  if (has(n,"广东") || has(n,"珠江") || has(n,"岭南") || has(n,"经济科教")) return "广东"
+  if (has(n,"江门") || has(n,"嘉佳") || has(n,"深圳") || has(n,"广州")) return "广东"
+  if (has(n,"佛山") || has(n,"南海") || has(n,"顺德") || has(n,"东莞")) return "广东"
+  if (has(n,"中山") || has(n,"珠海") || has(n,"汕头") || has(n,"湛江")) return "广东"
+  if (has(n,"茂名") || has(n,"肇庆") || has(n,"惠州") || has(n,"梅州")) return "广东"
+  if (has(n,"汕尾") || has(n,"河源") || has(n,"阳江") || has(n,"清远")) return "广东"
+  if (has(n,"潮州") || has(n,"揭阳") || has(n,"云浮") || has(n,"韶关")) return "广东"
+  if (has(n,"客家") || has(n,"香山") || has(n,"南国都市")) return "广东"
+  if (has(n,"CCTV") || has(n,"CGTN") || has(n,"CETV")) return "央视"
+  if (has(n,"央视") || has(n,"中央")) return "央视"
+  return "其他"
+}
+
+function score_of(q, hascatch) {
+  if (dedup == "catchup") return hascatch * 10 + q
+  return q * 2 + hascatch
+}
+
+# 同一频道在模板里可能被列进多个分组（如广东体育同属"广东"和"体育"、
+# CCTV-5 同属"央视"和"体育"），这时每个分组各输出一条，配额相同的去重 landlords 独立进行。
+function emit(name, live, catchup, k, g, rk,   kk, sc, id) {
+  kk = k SUBSEP g
+  sc = score_of(qual(name), (catchup == "" ? 0 : 1))
+  if (dedup == "all") {
+    n = n + 1; id = n
+  } else if (kk in keyidx) {
+    id = keyidx[kk]
+    if (sc <= SC[id]) { dropped++; return }
+  } else {
+    n = n + 1; id = n; keyidx[kk] = id
+  }
+  NAME[id] = name; LIVE[id] = live; CATCH[id] = catchup; KEY[id] = k
+  GRP[id] = g; RANK[id] = rk; Q[id] = qual(name); SC[id] = sc; ORD[id] = ++nseq
+}
+
+function addrec(name, live, catchup,   k, gi, g) {
+  if (name == "" || live == "") return
+  k = norm(name)
+
+  # 回看地址先入"借用池"、且必须在 isjunk 之前：
+  # 电信常把高清流的时移挂在名字带"测试"的条目上，若连时移一起过滤掉，
+  # 高清频道就只能借到标清时移，出现"直播高清/回看标清"的错位。
+  if (catchup != "" && qual(name) >= CQ[k]) { CQ[k] = qual(name); CAT[k] = catchup }
+
+  # 模板里明确收录的频道豁免过滤：用户列了就说明要它。
+  # 电信常把可用的高清源标成 "-测试"（如 CCTV-5+ 只有 "CCTV5＋体育高清-测试" 这一条），
+  # 照 isjunk 一律丢弃的话，这些台就永远出不来。
+  if (!(k in TN) && isjunk(name)) return
+
+  if (k in TN) {
+    for (gi = 1; gi <= TN[k]; gi++) emit(name, live, catchup, k, TG[k, gi], TRK[k, TG[k, gi]])
+  } else {
+    emit(name, live, catchup, k, cls(name), 999999)
+  }
+}
+
+# 排序：模板分组顺序 -> 模板内行序 -> 清晰度降序 -> 原始次序
+function before(a, b,   ga, gb) {
+  ga = (GRP[a] in GW) ? GW[GRP[a]] : 900
+  gb = (GRP[b] in GW) ? GW[GRP[b]] : 900
+  if (ga != gb) return ga < gb
+  if (RANK[a] != RANK[b]) return RANK[a] < RANK[b]
+  if (Q[a] != Q[b]) return Q[a] > Q[b]
+  return ORD[a] < ORD[b]
+}
+
+BEGIN {
+  n = 0; nseq = 0; tseq = 0; dropped = 0; tpl_n = 0; ngw = 0
+  ng = split(gorder, go, ",")
+  for (i = 1; i <= ng; i++) { if (go[i] != "" && !(go[i] in GW)) GW[go[i]] = ++ngw }
+
+  borrow = (ENVIRON["GD_BORROW"] == "0") ? 0 : 1
+  phproxy = ENVIRON["GD_PROXY"]
+  useproxy = (ENVIRON["GD_CATCHUP_PROXY"] == "1") ? 1 : 0
+  tzoff = ENVIRON["GD_TZ_OFFSET"]
+
+  # ---------- 读频道模板（分组 / 排序 / EPG 名）----------
+  tpl = ENVIRON["GD_TPL"]
+  if (tpl != "" && tpl != "-") {
+    while ((getline t < tpl) > 0) {
+      sub(/\r$/, "", t)
+      # 只认 #EXTINF 条目行；模板里的注释(# ...)、#EXTM3U 头一律跳过
+      if (substr(t, 1, 8) != "#EXTINF:") continue
+      if (!match(t, /group-title="[^"]*"/)) continue
+      gv = substr(t, RSTART + 13, RLENGTH - 14)
+      tv = ""
+      if (match(t, /tvg-id="[^"]*"/)) tv = substr(t, RSTART + 8, RLENGTH - 9)
+      dn = t; sub(/^.*,/, "", dn)
+      if (dn == "") continue
+      k = norm(dn)
+      if (k == "") continue
+      if (!(gv in GW)) GW[gv] = ++ngw
+      if (!(k in TDN)) { TDN[k] = dn; TTID[k] = (tv == "" ? dn : tv) }
+      # 同一频道允许归属多个分组；rank 取它在模板里的行号，保证组内顺序与模板一致
+      if (!((k SUBSEP gv) in TSEEN)) {
+        TSEEN[k SUBSEP gv] = 1
+        TN[k] = TN[k] + 1
+        TG[k, TN[k]] = gv
+        TRK[k SUBSEP gv] = ++tseq
+      }
+      tpl_n++
+    }
+    close(tpl)
+  }
+
+  # ---------- 读台标映射（可选）：频道名,tvg-logo ----------
+  lgf = ENVIRON["GD_LOGO"]
+  if (lgf != "" && lgf != "-") {
+    while ((getline t < lgf) > 0) {
+      sub(/\r$/, "", t)
+      if (substr(t, 1, 1) == "#") continue
+      p = index(t, ",")
+      if (p == 0) continue
+      LOGO[norm(substr(t, 1, p - 1))] = substr(t, p + 1)
+    }
+    close(lgf)
+  }
+}
+
 {
-	echo "{"
-	echo "  \"updated\": \"$(date '+%F %T')\","
-	echo "  \"mode\": \"$MODE\","
-	echo "  \"proxy\": \"$PROXY\","
-	echo "  \"channels\": ["
-	awk -F'|' '{
-		prefix = first ? ",\n" : ""
-		first = 1
-		printf "%s    {\"id\":\"%s\",\"name\":\"%s\",\"igmp\":\"%s\",\"rtsp\":\"%s\"}", prefix, $1, $8, $3, $4
-	}
-	END { if (first) printf "\n" }' "$MERGED"
-	echo "  ]"
-	echo "}"
-} > "$OUT/iptv.json"
+  total++
+  name = getattr($0, "ChannelName")
+  urlf = getattr($0, "ChannelURL")
+  ts   = getattr($0, "TimeShift")
+  tsu  = getattr($0, "TimeShiftURL")
+  if (name == "" || urlf == "") next
+
+  # ChannelURL 形如  igmp://239.77.x.x:5146|rtsp://125.88.x.x/PLTV/...smil
+  np = split(urlf, parts, "|")
+  rtsp = ""; igmp = ""
+  for (i = 1; i <= np; i++) {
+    if (substr(parts[i], 1, 7) == "igmp://") igmp = parts[i]
+    if (substr(parts[i], 1, 7) == "rtsp://") rtsp = parts[i]
+  }
+
+  if (igmp != "") live = "http://" phhost ":" phport "/rtp/" substr(igmp, 8) "?fcc=" fcc
+  else if (rtsp != "") live = rtsp
+  else next
+
+  # 回看：必须用 TimeShiftURL（ChannelURL 里的 rtsp 不能时移）
+  catchup = ""
+  if (ts == "1" && tsu != "" && substr(tsu, 1, 7) == "rtsp://") {
+    sub(/&playseek=.*$/, "", tsu)
+    catchup = tsu "&playseek=${(b)yyyyMMddHHmmss}-${(e)yyyyMMddHHmmss}"
+    if (tzoff != "" && tzoff != "0") catchup = catchup "&r2h-seek-offset=" tzoff
+    # 需要给无法直连 IPTV 专网的播放器使用时，改写成 rtp2httpd 的 RTSP 反代地址
+    if (useproxy) {
+      pfx = "http://" phhost ":" phport "/rtsp/"
+      rest = substr(tsu, 8)
+      if (index(rest, "/") > 0) {
+        hostp = substr(rest, 1, index(rest, "/") - 1)
+        path  = substr(rest, index(rest, "/"))
+        if (index(hostp, ":") == 0) hostp = hostp ":554"
+        catchup = pfx hostp path "&playseek=${(b)yyyyMMddHHmmss}-${(e)yyyyMMddHHmmss}"
+        if (tzoff != "" && tzoff != "0") catchup = catchup "&r2h-seek-offset=" tzoff
+      }
+    }
+  }
+
+  addrec(name, live, catchup)
+}
+
+END {
+  for (i = 1; i <= n; i++) idx[i] = i
+  for (i = 2; i <= n; i++) {
+    v = idx[i]; j = i - 1
+    while (j >= 1 && before(v, idx[j])) { idx[j + 1] = idx[j]; j-- }
+    idx[j + 1] = v
+  }
+
+  if (tvgurl == "") print "#EXTM3U"
+  else print "#EXTM3U url-tvg=\"" tvgurl "\""
+
+  for (i = 1; i <= n; i++) {
+    r = idx[i]
+    if (KEY[r] in TDN) { dname = TDN[KEY[r]] }
+    else { dname = NAME[r]; sub(/^CCTV[ \t]+-/, "CCTV-", dname) }
+    c = CATCH[r]
+    if (c == "" && borrow) c = CAT[KEY[r]]
+    tv = (KEY[r] in TTID) ? TTID[KEY[r]] : dname
+    lg = (KEY[r] in LOGO) ? LOGO[KEY[r]] : ""
+
+    line = "#EXTINF:-1 tvg-id=\"" tv "\" tvg-name=\"" tv "\""
+    if (lg != "") line = line " tvg-logo=\"" lg "\""
+    line = line " group-title=\"" GRP[r] "\""
+    if (c != "") line = line " catchup=\"default\" catchup-source=\"" c "\""
+    print line "," dname
+    print LIVE[r]
+  }
+  printf("__STAT__ %d %d %d %d\n", total, n, dropped, tpl_n) > "/dev/stderr"
+}
+AWKEOF
+}
+
+PHHOST=$(printf '%s' "$PROXY" | sed 's#:.*##')
+PHPORT=$(printf '%s' "$PROXY" | sed -n 's#^.*:##p')
+[ -z "$PHPORT" ] && PHPORT=5140
+
+[ -f "$TPL" ] || log "提示：无频道模板 $TPL，将用内置规则自动分类"
+[ -f "$LOGOCONF" ] || LOGOCONF=""
+
+export GD_TPL="$TPL"
+export GD_LOGO="$LOGOCONF"
+export GD_BORROW="$BORROW"
+export GD_PROXY="$PROXY"
+export GD_CATCHUP_PROXY="$CATCHUP_PROXY"
+export GD_TZ_OFFSET="$TZ_OFFSET"
+
+AWKF="$TMP/playlist.awk"
+STATF="$TMP/playlist.stat"
+build_awk > "$AWKF"
+
+PLIST="$OUT/playlist.m3u8"
+tr -d '\r\n' < "$TMP/list.raw" |
+	sed -e "s/CTCSetConfig('Channel',[ ]*'/\n/g" -e "s/');/\n/g" |
+	grep -i 'ChannelID=' |
+	awk -f "$AWKF" \
+		-v phhost="$PHHOST" -v phport="$PHPORT" -v fcc="$FCC" \
+		-v gorder="$GROUP_ORDER" -v dedup="$DEDUP" \
+		-v tvgurl="" \
+		> "$PLIST" 2> "$STATF"
+
+STAT=$(grep '^__STAT__' "$STATF" 2>/dev/null | head -1)
+TOTAL=$(echo "$STAT" | awk '{print $2}')
+KEPT=$(echo "$STAT" | awk '{print $3}')
+DROPPED=$(echo "$STAT" | awk '{print $4}')
+TPLN=$(echo "$STAT" | awk '{print $5}')
+
+rm -f "$AWKF" "$STATF"
+
+# EPG 下来后才知道 tvg-url；若有本地 EPG 就重跑一次带上 tvg-url
+gen_with_tvg() {
+	if [ -s "$OUT/epg.xml" ]; then
+		TVG="http://$LANIP/iptv/epg.xml"
+	else
+		TVG=""
+	fi
+	build_awk > "$TMP/playlist.awk"
+	tr -d '\r\n' < "$TMP/list.raw" |
+		sed -e "s/CTCSetConfig('Channel',[ ]*'/\n/g" -e "s/');/\n/g" |
+		grep -i 'ChannelID=' |
+		awk -f "$TMP/playlist.awk" \
+			-v phhost="$PHHOST" -v phport="$PHPORT" -v fcc="$FCC" \
+			-v gorder="$GROUP_ORDER" -v dedup="$DEDUP" \
+			-v tvgurl="$TVG" \
+			> "$PLIST" 2>/dev/null
+	rm -f "$TMP/playlist.awk"
+}
+
+if [ "${KEPT:-0}" -eq 0 ]; then
+	err "生成 0 个频道。原始列表：$TMP/list.raw"
+	err "可用 gdiptv-update -l 查看平台返回的原始频道名。"
+	exit 1
+fi
 
 # ---------------- 节目单 ----------------
 if [ -n "${EPG_URL:-}" ]; then
@@ -373,9 +606,30 @@ if [ -n "${EPG_URL:-}" ]; then
 			rm -f "$OUT/epg.xml"
 		fi
 	else
-		err "节目单下载失败（走的是 WAN，检查外网连通性）"
+		err "节目单下载失败（走的是 WAN，检查外网连通性；已有旧文件会保留）"
 	fi
 fi
+
+# EPG 就位后重生成一次播放列表，好在头部带上 url-tvg
+if [ -s "$OUT/epg.xml" ]; then
+	gen_with_tvg
+fi
+
+# 统计回看数量，便于确认回看功能有没有生效
+CATN=$(grep -c 'catchup-source=' "$PLIST" 2>/dev/null || echo 0)
+log "频道：平台 $TOTAL 条 -> 去重后 $KEPT 条（合并副本 $DROPPED），其中 $CATN 条带回看；模板收录 $TPLN 条规则"
+
+# ---------------- 酷9 / DIYP 文本源 ----------------
+awk '
+/^#EXTINF/ {
+	if (match($0, /group-title="[^"]*"/)) grp = substr($0, RSTART + 13, RLENGTH - 14)
+	else grp = "其他"
+	if (match($0, /tvg-id="[^"]*"/)) nm = substr($0, RSTART + 8, RLENGTH - 9)
+	else { nm = $0; sub(/^.*,/, "", nm) }
+	getline u
+	if (grp != last) { printf "%s,#genre#\n", grp; last = grp }
+	printf "%s,%s\n", nm, u
+}' "$PLIST" > "$OUT/iptv.txt"
 
 # ---------------- 索引页 ----------------
 cat > "$OUT/index.html" <<EOF
@@ -391,23 +645,48 @@ code{background:#eceff3;padding:2px 6px;border-radius:3px}
 </style></head>
 <body>
 <h1>广东电信 IPTV — 自动生成列表</h1>
-<p>最后更新：<b>$(date '+%Y-%m-%d %H:%M:%S')</b>　频道数：<b>$COUNT</b>　模式：<b>$MODE</b></p>
+<p>最后更新：<b>$(date '+%Y-%m-%d %H:%M:%S')</b>　频道：<b>$KEPT</b>　带回看：<b>$CATN</b></p>
 <table>
 <tr><th>用途</th><th>地址</th></tr>
-<tr><td>直播列表（m3u8）</td><td><a href="iptv.m3u8">/iptv/iptv.m3u8</a></td></tr>
-<tr><td>回看/时移（rtsp 单播）</td><td><a href="iptv-rtsp.m3u8">/iptv/iptv-rtsp.m3u8</a></td></tr>
+<tr><td>主播放列表（直播+回看）</td><td><a href="playlist.m3u8">/iptv/playlist.m3u8</a></td></tr>
 <tr><td>酷9/DIYP 文本源</td><td><a href="iptv.txt">/iptv/iptv.txt</a></td></tr>
 <tr><td>节目单（xmltv）</td><td><a href="epg.xml">/iptv/epg.xml</a></td></tr>
-<tr><td>频道明细（json）</td><td><a href="iptv.json">/iptv/iptv.json</a></td></tr>
-<tr><td>rtp2httpd 状态面板</td><td><a href="http://$LANIP:5140/status">http://$LANIP:5140/status</a></td></tr>
+<tr><td>rtp2httpd 播放列表</td><td><a href="http://$LANIP:5140/playlist.m3u">http://$LANIP:5140/playlist.m3u</a></td></tr>
 <tr><td>rtp2httpd 网页播放器</td><td><a href="http://$LANIP:5140/player">http://$LANIP:5140/player</a></td></tr>
+<tr><td>rtp2httpd 状态面板</td><td><a href="http://$LANIP:5140/status">http://$LANIP:5140/status</a></td></tr>
 </table>
 <p style="margin-top:20px;font-size:13px;color:#666">
-回看：在 rtsp 地址后追加 <code>&amp;playseek=20260101120000-20260101130000</code>（起始-结束，UTC+8）。<br>
+分组与排序来自 <code>/etc/gdiptv/channels.m3u</code>，直接编辑该文件即可调整。<br>
 手动刷新：<code>gdiptv-update -f</code>；抓取鉴权：<code>gdiptv-sniff</code>。
 </p>
 </body></html>
 EOF
 
-log "完成：$OUT/iptv.m3u8 / iptv-rtsp.m3u8 / iptv.txt / epg.xml"
+# ---------------- 把列表交给 rtp2httpd（外部 M3U）----------------
+# rtp2httpd 会自己定时拉取这份列表，并把里面的 rtsp 回看源转成 HTTP，
+# 于是它的网页播放器 /player 与 /playlist.m3u 都能直接看回看，
+# 电视/手机不必能直连 IPTV 专网（183.59/125.88 那些地址）。
+if [ -x /etc/init.d/rtp2httpd ] && [ -f /etc/config/rtp2httpd ]; then
+	RT_SEC=""
+	if uci -q show rtp2httpd.rtp2httpd >/dev/null 2>&1; then
+		RT_SEC="rtp2httpd.rtp2httpd"
+	elif uci -q show 'rtp2httpd.@rtp2httpd[0]' >/dev/null 2>&1; then
+		RT_SEC='rtp2httpd.@rtp2httpd[0]'
+	fi
+	if [ -n "$RT_SEC" ]; then
+		M3U_URL="http://127.0.0.1/iptv/playlist.m3u8"
+		CUR=$(uci -q get "$RT_SEC".external_m3u)
+		if [ "$CUR" != "$M3U_URL" ]; then
+			uci set "$RT_SEC".external_m3u="$M3U_URL"
+			uci set "$RT_SEC".external_m3u_update_interval='3600'
+			uci commit rtp2httpd
+			# reload 而非 restart：不会掐断正在观看的连接
+			/etc/init.d/rtp2httpd reload >/dev/null 2>&1 ||
+				/etc/init.d/rtp2httpd restart >/dev/null 2>&1
+			log "已写入 rtp2httpd.external_m3u = $M3U_URL 并重载服务"
+		fi
+	fi
+fi
+
+log "完成：$OUT/playlist.m3u8 / iptv.txt"
 exit 0
