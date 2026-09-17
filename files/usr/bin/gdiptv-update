@@ -69,6 +69,9 @@ EDS_PORT=$(uci -q get gdiptv.main.eds_port); EDS_PORT=${EDS_PORT:-8082}
 CACHE_DAYS=$(uci -q get gdiptv.main.cache_days); CACHE_DAYS=${CACHE_DAYS:-7}
 OUT=$(uci -q get gdiptv.main.output_dir); OUT=${OUT:-/www/iptv}
 EPG_BASE=$(uci -q get gdiptv.main.epg_base)
+# 隐藏频道补充表：电信不返回的频道（广东各地市台等）的组播地址
+HIDDEN_FILE=$(uci -q get gdiptv.main.hidden_file)
+HIDDEN_FILE=${HIDDEN_FILE:-/etc/gdiptv/hidden.txt}
 
 GROUP_ORDER=$(uci -q get gdiptv.main.group_order)
 GROUP_ORDER=${GROUP_ORDER:-广东,央视,卫视,体育,儿童,其他}
@@ -374,9 +377,15 @@ function emit(name, live, catchup, k, g, rk,   kk, sc, id) {
   GRP[id] = g; RANK[id] = rk; Q[id] = qual(name); SC[id] = sc; ORD[id] = ++nseq
 }
 
-function addrec(name, live, catchup,   k, gi, g) {
+function addrec(name, live, catchup, hid,   k, gi, g) {
   if (name == "" || live == "") return
   k = norm(name)
+
+  # 隐藏频道（参考表补进来的）只做补位：平台列表里已有同名 KEY 就跳过。
+  # 原因：平台频道带 TimeShiftURL（能回看/时移），隐藏源只有一个裸组播地址，
+  #      若让隐藏源把平台源顶掉，回看就没了。
+  if (hid && (k in SEENK)) return
+  SEENK[k] = 1
 
   # 回看地址先入"借用池"、且必须在 isjunk 之前：
   # 电信常把高清流的时移挂在名字带"测试"的条目上，若连时移一起过滤掉，
@@ -465,6 +474,8 @@ BEGIN {
   ts   = getattr($0, "TimeShift")
   tsu  = getattr($0, "TimeShiftURL")
   if (name == "" || urlf == "") next
+  # 参考表补进来的隐藏频道用 UserChannelID="hidden" 打标
+  ishid = (getattr($0, "UserChannelID") == "hidden")
 
   # ChannelURL 形如  igmp://239.77.x.x:5146|rtsp://125.88.x.x/PLTV/...smil
   np = split(urlf, parts, "|")
@@ -498,7 +509,7 @@ BEGIN {
     }
   }
 
-  addrec(name, live, catchup)
+  addrec(name, live, catchup, ishid)
 }
 
 END {
@@ -509,8 +520,10 @@ END {
     idx[j + 1] = v
   }
 
+  # 两个属性都写：rtp2httpd 两种都认，但播放器各有所好
+  #   x-tvg-url -> TiviMate / OTT 系；url-tvg -> IPTV Smarters / PotPlayer 系
   if (tvgurl == "") print "#EXTM3U"
-  else print "#EXTM3U url-tvg=\"" tvgurl "\""
+  else print "#EXTM3U x-tvg-url=\"" tvgurl "\" url-tvg=\"" tvgurl "\""
 
   for (i = 1; i <= n; i++) {
     r = idx[i]
@@ -551,10 +564,43 @@ AWKF="$TMP/playlist.awk"
 STATF="$TMP/playlist.stat"
 build_awk > "$AWKF"
 
+# ---------------- 隐藏频道注入 ----------------
+# 电信把一批频道从 getchannellistHWCTC.jsp 里藏掉了（主要是广东各地市台），
+# 但组播地址其实是照常播的。参考表 hidden.txt 里记了这些地址，
+# 转成和平台列表一样的输入行喂给同一个 awk，就能自动享受分组/排序/去重。
+# 格式：频道名|组播地址:端口
+emit_hidden() {
+	[ -s "$HIDDEN_FILE" ] || return 0
+	awk -F'|' '
+		/^[ \t]*#/ { next }
+		/^[ \t]*$/ { next }
+		{
+			nm = $1; gsub(/^[ \t]+|[ \t]+$/, "", nm)
+			ad = $2; gsub(/^[ \t]+|[ \t]+$/, "", ad)
+			if (nm == "" || ad == "") next
+			printf("ChannelName=\"%s\",UserChannelID=\"hidden\",ChannelURL=\"igmp://%s\"\n", nm, ad)
+		}
+	' "$HIDDEN_FILE"
+}
+
+# 平台列表在前、隐藏频道在后：awk 流式处理时平台源先入库，
+# 隐藏源就能靠 addrec 里的 SEENK 判断为自己只做补位。
+feed_channels() {
+	tr -d '\r\n' < "$TMP/list.raw" |
+		sed -e "s/CTCSetConfig('Channel',[ ]*'/\n/g" -e "s/');/\n/g" |
+		grep -i 'ChannelID='
+	emit_hidden
+}
+
 PLIST="$OUT/playlist.m3u8"
-tr -d '\r\n' < "$TMP/list.raw" |
-	sed -e "s/CTCSetConfig('Channel',[ ]*'/\n/g" -e "s/');/\n/g" |
-	grep -i 'ChannelID=' |
+
+HID_N=0
+if [ -s "$HIDDEN_FILE" ]; then
+	HID_N=$(emit_hidden | wc -l | tr -d ' ')
+	log "隐藏频道补充表加载 $HID_N 条（$HIDDEN_FILE）"
+fi
+
+feed_channels |
 	awk -f "$AWKF" \
 		-v phhost="$PHHOST" -v phport="$PHPORT" -v fcc="$FCC" \
 		-v gorder="$GROUP_ORDER" -v dedup="$DEDUP" \
@@ -577,9 +623,7 @@ gen_with_tvg() {
 		TVG=""
 	fi
 	build_awk > "$TMP/playlist.awk"
-	tr -d '\r\n' < "$TMP/list.raw" |
-		sed -e "s/CTCSetConfig('Channel',[ ]*'/\n/g" -e "s/');/\n/g" |
-		grep -i 'ChannelID=' |
+	feed_channels |
 		awk -f "$TMP/playlist.awk" \
 			-v phhost="$PHHOST" -v phport="$PHPORT" -v fcc="$FCC" \
 			-v gorder="$GROUP_ORDER" -v dedup="$DEDUP" \
@@ -666,30 +710,57 @@ code{background:#eceff3;padding:2px 6px;border-radius:3px}
 </body></html>
 EOF
 
-# ---------------- 把列表交给 rtp2httpd（外部 M3U）----------------
-# rtp2httpd 会自己定时拉取这份列表，并把里面的 rtsp 回看源转成 HTTP，
-# 于是它的网页播放器 /player 与 /playlist.m3u 都能直接看回看，
+# ---------------- 成功出列表后：自动启用 rtp2httpd 并挂载外部 M3U ----------------
+# rtp2httpd 会定时拉取这份列表，把里面的 rtsp 回看源转成 HTTP，
+# 于是它的 /player 网页播放器与 /playlist.m3u 能直接看回看，
 # 电视/手机不必能直连 IPTV 专网（183.59/125.88 那些地址）。
-if [ -x /etc/init.d/rtp2httpd ] && [ -f /etc/config/rtp2httpd ]; then
-	RT_SEC=""
-	if uci -q show rtp2httpd.rtp2httpd >/dev/null 2>&1; then
-		RT_SEC="rtp2httpd.rtp2httpd"
-	elif uci -q show 'rtp2httpd.@rtp2httpd[0]' >/dev/null 2>&1; then
-		RT_SEC='rtp2httpd.@rtp2httpd[0]'
+#
+# 坑（血泪）：rtp2httpd 的 init.d 只认 `config instance` 节 ——
+#   config_foreach validate_rtp2httpd_section "instance" start_instance
+#   旧式的 `config rtp2httpd` 节会被**完全忽略**，往那里写等于白写。
+#   之前正是错在这里：检测到 @rtp2httpd[0] 就往里写，服务侧毫无反应。
+if [ -x /etc/init.d/rtp2httpd ] && [ -s "$OUT/playlist.m3u8" ]; then
+	# 统一维护 @instance[0]，不存在就建一个
+	uci -q show 'rtp2httpd.@instance[0]' >/dev/null 2>&1 ||
+		uci -q add rtp2httpd instance >/dev/null
+	RT_SEC='rtp2httpd.@instance[0]'
+
+	# 上行口必须是 IPTV 的 pppoe 设备，否则组播/RTSP 抓不到流
+	UP_DEV=$(ifstatus iptv 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null | head -1)
+	[ -n "$UP_DEV" ] || UP_DEV="pppoe-iptv"
+
+	# file:// 直接读本地文件，不必依赖 uhttpd 的 80 端口
+	M3U_URL="file://$OUT/playlist.m3u8"
+
+	uci set "$RT_SEC".enabled='1'
+	uci set "$RT_SEC".listen='0.0.0.0:5140'
+	uci set "$RT_SEC".upstream_interface="$UP_DEV"
+	uci set "$RT_SEC".external_m3u="$M3U_URL"
+	uci set "$RT_SEC".external_m3u_update_interval='3600'
+	uci -q set "$RT_SEC".cors_allow_origin='*'
+	uci commit rtp2httpd
+
+	/etc/init.d/rtp2httpd enable  >/dev/null 2>&1
+	/etc/init.d/rtp2httpd restart >/dev/null 2>&1
+	sleep 3
+
+	if netstat -tlnp 2>/dev/null | grep -q ':5140'; then
+		log "rtp2httpd 已启用：$M3U_URL（上行口 $UP_DEV）"
+		log "  网页播放器 http://$LANIP:5140/player    列表 http://$LANIP:5140/playlist.m3u"
+	else
+		log "警告：rtp2httpd 配置已写入但没起来，用 logread -e rtp2httpd 查原因"
 	fi
-	if [ -n "$RT_SEC" ]; then
-		M3U_URL="http://127.0.0.1/iptv/playlist.m3u8"
-		CUR=$(uci -q get "$RT_SEC".external_m3u)
-		if [ "$CUR" != "$M3U_URL" ]; then
-			uci set "$RT_SEC".external_m3u="$M3U_URL"
-			uci set "$RT_SEC".external_m3u_update_interval='3600'
-			uci commit rtp2httpd
-			# reload 而非 restart：不会掐断正在观看的连接
-			/etc/init.d/rtp2httpd reload >/dev/null 2>&1 ||
-				/etc/init.d/rtp2httpd restart >/dev/null 2>&1
-			log "已写入 rtp2httpd.external_m3u = $M3U_URL 并重载服务"
-		fi
+
+	# 旧式节（若/UCI 里还留着）对 init.d 无效，提醒一下别被它误导
+	if uci -q show 'rtp2httpd.@rtp2httpd[0]' >/dev/null 2>&1; then
+		log "提示：/etc/config/rtp2httpd 里的旧式 'config rtp2httpd' 节被 init.d 忽略，"
+		log "      实际生效的是 'config instance' 节，改配置请改后者。"
 	fi
+else
+	[ -x /etc/init.d/rtp2httpd ] ||
+		log "未安装 rtp2httpd，跳过外部列表挂载"
+	[ -s "$OUT/playlist.m3u8" ] ||
+		log "播放列表为空，未挂载到 rtp2httpd（先确认鉴权成功）"
 fi
 
 log "完成：$OUT/playlist.m3u8 / iptv.txt"
