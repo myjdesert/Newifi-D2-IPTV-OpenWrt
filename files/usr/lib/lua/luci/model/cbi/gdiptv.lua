@@ -80,7 +80,10 @@ o.optional = true
 
 -- ---------------- 操作按钮 ----------------
 btn = s2:option(Button, "_apply", "保存并重拨",
-  "把账号/密码/MAC/设备同步到 network.iptv 并重拨，随后强制刷新列表（约需 1 分钟）")
+  "把账号/密码/MAC/设备同步到 network.iptv。<b>仅当拨号参数有变化时才真正重拨</b>。<br>" ..
+  "<b>注意：</b>电信局端释放上一条 PPPoE 会话约需 1~3 分钟，这期间日志会反复刷 " ..
+  "<code>Timeout waiting for PADO packets</code>，属正常现象，netifd 会自动重试直到成功。" ..
+  "<b>不要反复点这个按钮</b>——每重拨一次，这 3 分钟就重新计时。")
 btn.inputtitle = "保存并重拨 IPTV"
 btn.inputstyle = "apply"
 function btn.write(self, section)
@@ -89,6 +92,13 @@ function btn.write(self, section)
 	local mac = fv("macaddr")
 	local dev = fv("iptv_device")
 	if dev == "" then dev = "wan" end
+
+	-- 先读 network.iptv 的旧值：拨号参数没变就别重拨，免得白等局端 3 分钟
+	local ou = uci:get("network", "iptv", "username") or ""
+	local op = uci:get("network", "iptv", "password") or ""
+	local om = uci:get("network", "iptv", "macaddr") or ""
+	local od = uci:get("network", "iptv", "device") or "wan"
+	local changed = (u ~= ou) or (p ~= op) or (mac ~= om) or (dev ~= od)
 
 	sys.call("uci -q set network.iptv.device="   .. esc(dev))
 	sys.call("uci -q set network.iptv.username=" .. esc(u))
@@ -100,11 +110,18 @@ function btn.write(self, section)
 	end
 	sys.call("uci -q commit network")
 
-	-- 后台执行：只重拨 iptv 接口（不动 lan，避免把 LuCI 连接掐断）
-	sys.call(
-		"( /sbin/ifdown iptv 2>/dev/null; sleep 2; /sbin/ifup iptv 2>/dev/null; " ..
-		"sleep 15; /usr/bin/gdiptv-update -f ) >/tmp/gdiptv-update.log 2>&1 &"
-	)
+	if changed then
+		-- 后台执行：只重拨 iptv 接口（不动 lan，避免把 LuCI 连接掐断）
+		sys.call(
+			"( /sbin/ifdown iptv 2>/dev/null; sleep 2; /sbin/ifup iptv 2>/dev/null; " ..
+			"sleep 15; /usr/bin/gdiptv-update -f ) >/tmp/gdiptv-update.log 2>&1 &"
+		)
+		m.message = "拨号参数已变更，正在重拨 IPTV。局端释放旧会话约需 1~3 分钟，"
+			.. "期间日志刷 PADO timeout 属正常，请勿反复重拨，等待自动重试成功即可。"
+	else
+		sys.call("/usr/bin/gdiptv-update -f >/tmp/gdiptv-update.log 2>&1 &")
+		m.message = "拨号参数与当前一致，已跳过重拨（避免白等局端 3 分钟），仅刷新频道列表。"
+	end
 end
 
 btn2 = s2:option(Button, "_update", "仅刷新列表",
