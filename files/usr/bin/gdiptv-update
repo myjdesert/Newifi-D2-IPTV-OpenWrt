@@ -184,22 +184,26 @@ do_fetch() {
 	fi
 
 	# 2) 鉴权
-	rm -f "$TMP/cookie.txt" "$TMP/auth.html"
-	curl -sS --max-time 30 -c "$TMP/cookie.txt" \
+	rm -f "$TMP/cookie.txt" "$TMP/auth.html" "$TMP/auth.head"
+	curl -sS --max-time 30 -c "$TMP/cookie.txt" -D "$TMP/auth.head" \
 		-H 'Content-Type: application/x-www-form-urlencoded' \
 		--data-binary "$AUTH_BODY" \
 		"$burl/EPG/jsp/ValidAuthenticationHWCTC.jsp" -o "$TMP/auth.html" 2>/dev/null
 
-	# 鉴权失败时平台照样会下发一个值为空的 JSESSIONID，必须校验 cookie 值非空
-	if ! grep -v '^#' "$TMP/cookie.txt" 2>/dev/null |
-		awk 'NF >= 7 && $7 != "" && $7 != "\"\"" { found = 1 } END { exit !found }'; then
-		err "鉴权失败：没有拿到有效的会话 Cookie。"
+	# 鉴权失败时平台照样返回 200 并下发一个值为空的 JSESSIONID（Set-Cookie: JSESSIONID="";），
+	# 所以必须校验 Set-Cookie 里确实有非空的值。
+	# 注意：不要拿 cookie 文件去判断 —— curl 存 HttpOnly cookie 时会写成
+	# "#HttpOnly_<host> ..." 开头，容易被当成注释行整行滤掉，导致明明成功却误判失败。
+	# 直接看响应头最可靠。
+	if ! tr -d '\r' < "$TMP/auth.head" 2>/dev/null |
+		grep -i '^set-cookie:' | grep -qE '=[^;"[:space:]]+'; then
+		err "鉴权失败：Set-Cookie 里没有有效的会话 ID。"
 		if grep -q 'isSucessed *= *false' "$TMP/auth.html" 2>/dev/null; then
 			err "平台返回 isSucessed=false —— auth_body 不对或已过期。"
 			err "若 auth_body 形如 'UserID=xxx&Action=Login'，那是 EDS 的 GET 查询串、"
 			err "不是鉴权 postBody，请重新用 gdiptv-sniff 抓包。"
 		fi
-		err "平台原始返回已保存到 $TMP/auth.html"
+		err "平台原始返回已保存到 $TMP/auth.html（响应头 $TMP/auth.head）"
 		return 1
 	fi
 	log "鉴权成功"

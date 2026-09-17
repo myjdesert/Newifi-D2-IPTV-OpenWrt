@@ -37,7 +37,7 @@ jobs:
           echo " Source : ${{ env.REPO_URL }} @ ${{ env.REPO_TAG }}"
           echo " Target : ramips / mt7621 / d-team_newifi-d2"
           echo " 拓扑   : 主路由上网 + D2 拨号 IPTV(旁路由)"
-          echo " IPTV   : rtp2httpd + udpxy + igmpproxy + 鉴权/回看/节目单脚本"
+          echo " IPTV   : rtp2httpd + igmpproxy + 鉴权/回看/节目单脚本"
           echo " 时间   : $(date '+%Y-%m-%d %H:%M:%S %Z')"
           echo "============================================"
 
@@ -67,11 +67,14 @@ jobs:
 
       - name: Create swap file
         run: |
-          sudo dd if=/dev/zero of=/mnt/swapfile bs=1M count=8192
+          # 只开 2GB：runner 根目录磁盘有限，OpenWrt 全量编译本身就要十几 GB，
+          # swap 开太大反而会把磁盘挤爆，导致 binutils 链接时 ld 失败。
+          sudo dd if=/dev/zero of=/mnt/swapfile bs=1M count=2048
           sudo chmod 600 /mnt/swapfile
           sudo mkswap /mnt/swapfile
           sudo swapon /mnt/swapfile
           free -h
+          df -h /
 
       - name: Clone source code
         run: |
@@ -86,16 +89,24 @@ jobs:
           grep -rn "d-team_newifi-d2" target/linux/mediatek/image/*.mk 2>/dev/null | head -3 || \
           (echo "!! 未找到设备定义"; exit 1)
 
-      - name: Cache toolchain and dl
+      - name: Cache downloaded sources
         uses: actions/cache@v4
         with:
-          path: |
-            openwrt/dl
-            openwrt/staging_dir
-            openwrt/build_dir/host
-          key: ${{ runner.os }}-newifi-d2-${{ env.REPO_TAG }}-${{ hashFiles('configs/newifi-d2-iptv.config') }}
+          # 只缓存 dl（源码 tarball）。
+          #
+          # 曾经把 staging_dir 也一起缓存，结果造成"缓存中毒"、连续 6 次编译必挂：
+          # 首次成功时存下了含目标机 musl 头文件的 staging_dir/toolchain-*，
+          # 但没存 build_dir/toolchain-*。之后每次恢复出 musl 头文件、
+          # build_dir 却是空的，binutils 被迫从头重编，编译时 -I 吃进 musl 头，
+          # time 被重定向成 __time64，最后用 host glibc 链接 as-new 时
+          # 报 "undefined reference to __time64"，toolchain/binutils 直接失败。
+          #
+          # 结论：OpenWrt 的 staging_dir 与 build_dir/toolchain-* 必须同生同死，
+          # 只缓存其中一个必然出错。这里索性只缓存 dl，工具链每次全新编译。
+          path: openwrt/dl
+          key: ${{ runner.os }}-d2iptv-dl-${{ env.REPO_TAG }}-${{ hashFiles('configs/newifi-d2-iptv.config') }}
           restore-keys: |
-            ${{ runner.os }}-newifi-d2-${{ env.REPO_TAG }}-
+            ${{ runner.os }}-d2iptv-dl-${{ env.REPO_TAG }}-
 
       - name: Run DIY script (part 1)
         run: |
@@ -179,6 +190,29 @@ jobs:
             make download -j1 V=s 2>&1 | tail -50
           }
 
+      - name: Compile tools
+        run: |
+          cd openwrt
+          echo "tools 编译开始 $(date)"
+          make tools/compile -j$(nproc) V=s 2>&1 | tail -40
+          echo "tools 编译结束 $(date)"
+
+      - name: Compile toolchain
+        run: |
+          cd openwrt
+          echo "toolchain 编译开始 $(date)"
+          set +e
+          make toolchain/compile -j$(nproc) V=s 2>&1 | tail -60
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            echo "===== toolchain -j2 失败(rc=$rc)，降到 -j1 重试 ====="
+            make toolchain/compile -j1 V=s 2>&1 | tail -80
+            rc=${PIPESTATUS[0]}
+          fi
+          set -e
+          echo "toolchain 编译结束 $(date) rc=$rc"
+          exit $rc
+
       - name: Compile firmware
         run: |
           cd openwrt
@@ -187,8 +221,8 @@ jobs:
           make -j$(nproc) V=s 2>&1 | tee build.log | tail -100
           rc=${PIPESTATUS[0]}
           if [ "$rc" -ne 0 ]; then
-            echo "===== 首次编译失败(rc=$rc)，单线程重试 ====="
-            make -j1 V=s 2>&1 | tail -300
+            echo "===== 首次编译失败(rc=$rc)，降到 -j2 重试 ====="
+            make -j2 V=s 2>&1 | tail -300
             rc=${PIPESTATUS[0]}
           fi
           set -e
